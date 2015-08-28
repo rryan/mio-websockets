@@ -112,27 +112,20 @@ impl WebSocketClient {
         self.socket.try_write(response.as_bytes()).unwrap();
     }
 
-    fn read(&mut self) {
+    fn handshake_request(&mut self) -> bool {
         loop {
             let mut buf = [0; 2048];
             match self.socket.try_read(&mut buf) {
                 Err(e) => {
-                    println!("Error while reading socket: {:?}", e);
-                    return
+                    panic!("Error while reading socket: {:?}", e);
                 },
                 Ok(None) =>
                     // Socket buffer has got no more bytes.
-                    break,
+                    return false,
                 Ok(Some(_len)) => {
                     self.http_parser.parse(&buf);
                     if self.http_parser.is_upgrade() {
-                        // Change the current state
-                        self.state = ClientState::HandshakeResponse;
-
-                        // Change current interest to `Writable`
-                        self.interest.remove(EventSet::readable());
-                        self.interest.insert(EventSet::writable());
-                        break;
+                        return true;
                     }
                 }
             }
@@ -311,8 +304,18 @@ impl Handler for WebSocketServer {
                 }
             } else {
                 let mut client = self.clients.get_mut(&token).unwrap();
-                client.read();
-                reregister_token = Some(token);
+                match client.state {
+                    ClientState::AwaitingHandshake => {
+                        if true == client.handshake_request() {
+                            client.state = ClientState::HandshakeResponse;
+                            reregister_token = Some(token);
+                        }
+                    },
+                    ClientState::HandshakeResponse => unreachable!(),
+                    ClientState::Open => {
+                        // FIXME: implement
+                    },
+                }
             }
         }
 
@@ -324,7 +327,7 @@ impl Handler for WebSocketServer {
                     ClientState::HandshakeResponse => {
                         client.handshake_response();
                         client.state      = ClientState::Open;
-                        reregister_token = Some(token);
+                        reregister_token  = Some(token);
                     },
                     ClientState::Open => {},
                 }
