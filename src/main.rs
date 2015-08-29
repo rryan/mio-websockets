@@ -1,3 +1,9 @@
+/*
+ * TODO
+ * + handle the half-closed, full-closed states correctly
+ * + handle errors, don't unwrap everything
+ * + handle multiframe messages
+ */
 extern crate mio;
 extern crate http_muncher;
 extern crate sha1;
@@ -23,14 +29,23 @@ use rustc_serialize::base64::{ToBase64, STANDARD};
 enum InternalMessage {
     NewClient{client_token: Token},
     CloseClient{client_token: Token},
-    Data{client_token: Token, format: String, data: String},
+    TextData{client_token: Token, data: String},
+    BinaryData{client_token: Token, data: Vec<u8>},
 }
 
-struct DataFrame {
-    op_code: OpCode,
-    payload_len: u64,
-    masking_key: [u8; 4],
-    payload: Vec<u8>
+fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalMessage> {
+    let msg = match opcode {
+        OpCode::Text =>
+            InternalMessage::TextData{
+                client_token: token,
+                data: String::from_utf8(data).unwrap()
+            },
+        OpCode::Binary => InternalMessage::BinaryData{client_token: token, data: data},
+        OpCode::Close => InternalMessage::CloseClient{client_token: token},
+        _ => {return None;},
+    };
+
+    Some(msg)
 }
 
 pub const OP_CODE_MASK: u8 = 0b0000_1111;
@@ -132,7 +147,6 @@ struct WebSocketClient {
     socket: TcpStream,
     headers: Rc<RefCell<HashMap<String, String>>>,
     http_parser: Parser<HttpParser>,
-    interest: EventSet,
     state: ClientState,
     writing_substate: SubState,
     reading_substate: SubState,
@@ -150,7 +164,6 @@ impl WebSocketClient {
                 current_key: None,
                 headers: headers.clone()
             }),
-            interest: EventSet::readable(),
             state: ClientState::AwaitingHandshake,
             writing_substate: SubState::Waiting,
             reading_substate: SubState::Waiting,
@@ -363,7 +376,7 @@ impl WebSocketClient {
 
     fn read_application_data(&mut self, len : usize) -> Option<Vec<u8>> {
         let mut buff = Vec::new();
-        std::io::Read::by_ref(&mut self.socket).take(len as u64).read_to_end(&mut buff);
+        std::io::Read::by_ref(&mut self.socket).take(len as u64).read_to_end(&mut buff).unwrap();
         return Some(buff);
     }
 }
@@ -434,7 +447,7 @@ impl InternalWriter {
         // FIXME: correct way to handle `poke`?
         let poke = "a";
         self.pipe_writer.write(poke.to_string().as_bytes()).unwrap();
-        self.pipe_writer.flush();
+        self.pipe_writer.flush().unwrap();
         self.input_tx.send(msg).unwrap();
     }
 }
@@ -526,7 +539,8 @@ impl Handler for WebSocketServer {
                     Ok(InternalMessage::NewClient{client_token: _}) => {},
                     Err(_e) => {},
                     Ok(InternalMessage::CloseClient{client_token: token}) |
-                        Ok(InternalMessage::Data{client_token: token, format: _, data: _}) => {
+                        Ok(InternalMessage::TextData{client_token: token, data: _}) |
+                        Ok(InternalMessage::BinaryData{client_token: token, data: _}) => {
                         match self.clients.get_mut(&token) {
                             Some(client) => {
                                 if client.state == ClientState::Open {
@@ -556,9 +570,13 @@ impl Handler for WebSocketServer {
                         println!("GOT MSG");
                         match client.read_message() {
                             None => {},
-                            Some((opcode, payload)) => println!("PAYLOAD: {:?}", payload),
+                            Some((opcode, data)) => {
+                                match im_from_wire(token, opcode, data) {
+                                    Some(m) => {self.output_tx.send(m).unwrap();}
+                                    None => {},
+                                }
+                            },
                         }
-                        // self.output_tx.send(InternalMessage::Data
                     },
                 }
             }
@@ -580,11 +598,14 @@ impl Handler for WebSocketServer {
                         assert!(client.writing_substate == SubState::Doing);
                         assert!(client.outgoing_messages.len() > 0);
                         match client.outgoing_messages.pop_front() {
-                            Some(InternalMessage::Data{client_token: token, format, data}) => {
+                            Some(InternalMessage::TextData{client_token: _token, data: _data}) => {
                                 // FIXME
                                 // client.write_message(OpCode::Text, &mut m.into_bytes());
                             },
-                            Some(InternalMessage::CloseClient{client_token: token}) => {
+                            Some(InternalMessage::BinaryData{client_token: _token, data: _data}) => {
+                                // FIXME
+                            },
+                            Some(InternalMessage::CloseClient{client_token: _}) => {
                                 client.write_message(OpCode::Close, &mut vec!());
                                 client.writing_substate = SubState::Waiting;
                             },
@@ -644,8 +665,12 @@ fn main() {
             InternalMessage::CloseClient{client_token: token} => {
                 println!("Close Client: {:?}", token);
             },
-            InternalMessage::Data{client_token: _token, format: _format, data: _data} =>
-                {},
+            InternalMessage::BinaryData{client_token: _, data} => {
+                println!("Binary Data: {:?}", data);
+            },
+            InternalMessage::TextData{client_token: _, data} => {
+                println!("Text Data: {:?}", data);
+            },
         }
 
         // disconnect
