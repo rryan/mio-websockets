@@ -2,6 +2,7 @@ extern crate mio;
 extern crate http_muncher;
 extern crate sha1;
 extern crate rustc_serialize;
+extern crate byteorder;
 
 use std::collections::HashMap;
 use std::collections::LinkedList;
@@ -32,31 +33,16 @@ struct DataFrame {
     payload: Vec<u8>
 }
 
-/// Decodes OpCode
-pub const OP_CODE_UN_MASK: u8 = 0b0000_1111;
-
-/// Encodes OpCode
-pub const OP_CODE_MASK: u8 = 0b1000_0000;
-
-/// Decodes payload
+pub const OP_CODE_MASK: u8 = 0b0000_1111;
+pub const FINAL_FRAME_MASK: u8 = 0b1000_0000;
+pub const MASKING_MASK: u8 = 0b1000_0000;
 pub const PAYLOAD_KEY_UN_MASK: u8 = 0b0111_1111;
 
-/// Continuation Op byte
 pub const OP_CONTINUATION: u8 = 0x0;
-
-/// Text Op byte
 pub const OP_TEXT: u8 = 0x1;
-
-/// Binary Op byte
 pub const OP_BINARY: u8 = 0x2;
-
-/// Close Op byte
 pub const OP_CLOSE: u8 = 0x8;
-
-/// Ping Op byte
 pub const OP_PING: u8 = 0x9;
-
-/// Pong Op byte
 pub const OP_PONG: u8 = 0xA;
 
 pub enum OpCode {
@@ -136,6 +122,7 @@ enum ClientState {
     Open,
 }
 
+#[derive(PartialEq)]
 enum SubState {
     Waiting,
     Doing,
@@ -185,7 +172,7 @@ impl WebSocketClient {
         self.socket.try_write(response.as_bytes()).unwrap();
     }
 
-    fn write_response(&mut self, op: OpCode, payload: &mut Vec<u8>) {
+    fn write_message(&mut self, op: OpCode, payload: &mut Vec<u8>) {
         let mut out_buf: Vec<u8> = Vec::with_capacity(payload.len() + 9);
 
         self.set_op_code(&op, &mut out_buf);
@@ -209,7 +196,7 @@ impl WebSocketClient {
             OpCode::Ping            => OP_PING,
             OpCode::Pong            => OP_PONG
         };
-        buf.push(op_code | OP_CODE_MASK);
+        buf.push(op_code | MASKING_MASK);
     }
 
     fn set_payload_info(&self, len: usize, buf: &mut Vec<u8>) {
@@ -267,6 +254,117 @@ impl WebSocketClient {
                 }
             }
         }
+    }
+
+    // return none if it's a multiframe message and we aren't on the last frame yet
+    fn read_message(&mut self) -> Option<(OpCode, Vec<u8>)> {
+        let (opcode, final_frame) : (OpCode, bool) = match self.read_op_code() {
+            None => {
+                println!("bad opcode");
+                return None;
+            }
+            Some((o, ff)) => (o, ff)
+        };
+
+        if false == final_frame {
+            println!("no support for multiframe messages");
+            return None;
+        }
+
+        let (payload_len,masking):(u64,bool) = match self.read_payload_length_and_masking_bit() {
+            None => {
+                println!("bad payload length or masking bit");
+                return None;
+            }
+            Some((len, masking)) => (len, masking)
+        };
+
+        let masking_key = match masking {
+            true  => self.read_masking_key(),
+            false => None,
+        };
+
+        // XXX: read extension data
+
+        // XXX
+        if payload_len > (usize::max_value() as u64) {
+            println!("payload length too large");
+            return None;
+        }
+
+        let payload_len = payload_len as usize;
+        let app_data = match self.read_application_data(payload_len) {
+            None => {
+                println!("bad application data");
+                return None;
+            }
+            Some(data) => data
+        };
+        assert!(app_data.len() == payload_len);
+
+        if masking_key.is_none() {
+            return Some((opcode, app_data));
+        }
+        let masking_key = masking_key.unwrap();
+
+        let mut output = Vec::<u8>::with_capacity(payload_len);
+        for i in 0..payload_len {
+            output.push(app_data[i] ^ masking_key[i % 4]);
+        }
+
+        return Some((opcode, output))
+    }
+
+    fn read_op_code(&mut self) -> Option<(OpCode, bool)> {
+        let mut buff = Vec::new();
+        std::io::Read::by_ref(&mut self.socket).take(1).read_to_end(&mut buff).unwrap();
+        let op = match buff[0] & OP_CODE_MASK {
+            OP_CONTINUATION => OpCode::Continuation,
+            OP_TEXT         => OpCode::Text,
+            OP_BINARY       => OpCode::Binary,
+            OP_CLOSE        => OpCode::Close,
+            OP_PING         => OpCode::Ping,
+            OP_PONG         => OpCode::Pong,
+            _ => return None,
+        };
+
+        Some((op, (buff[0] & FINAL_FRAME_MASK) == FINAL_FRAME_MASK))
+    }
+
+    fn read_payload_length_and_masking_bit(&mut self) -> Option<(u64, bool)> {
+        use byteorder::ReadBytesExt;
+
+        let mut buff = Vec::new();
+        std::io::Read::by_ref(&mut self.socket).take(1).read_to_end(&mut buff).unwrap();
+        let masking : bool = (buff[0] & MASKING_MASK) == MASKING_MASK;
+        let key     : u8   = buff[0] & PAYLOAD_KEY_UN_MASK;
+
+        // network byte order (big endian)
+        let len = match key {
+            0 ... 125 => key as u64,
+            126  => {
+                // self.socket.by_ref().take(2).read_to_end(&buff);
+                self.socket.read_u16::<byteorder::BigEndian>().unwrap() as u64
+            },
+            127  => {
+                self.socket.read_u64::<byteorder::BigEndian>().unwrap()
+            },
+            _ => unreachable!(),
+        };
+
+        Some((len, masking))
+    }
+
+    fn read_masking_key(&mut self) -> Option<Vec<u8>> {
+        let mut buff = Vec::new();
+        std::io::Read::by_ref(&mut self.socket).take(4).read_to_end(&mut buff).unwrap();
+        return Some(buff);
+    }
+
+    fn read_application_data(&mut self, len : usize) -> Option<Vec<u8>> {
+        let mut buff = Vec::new();
+        std::io::Read::by_ref(&mut self.socket).take(len as u64).read_to_end(&mut buff);
+        return Some(buff);
     }
 }
 
@@ -445,14 +543,22 @@ impl Handler for WebSocketServer {
                 let mut client = self.clients.get_mut(&token).unwrap();
                 match client.state {
                     ClientState::AwaitingHandshake => {
+                        assert!(client.reading_substate == SubState::Waiting);
                         if true == client.handshake_request() {
                             client.state = ClientState::HandshakeResponse;
+                            client.reading_substate = SubState::Doing;
                             reregister_token = Some(token);
                         }
                     },
                     ClientState::HandshakeResponse => unreachable!(),
                     ClientState::Open => {
-                        // FIXME: implement
+                        assert!(client.reading_substate == SubState::Doing);
+                        println!("GOT MSG");
+                        match client.read_message() {
+                            None => {},
+                            Some((opcode, payload)) => println!("PAYLOAD: {:?}", payload),
+                        }
+                        // self.output_tx.send(InternalMessage::Data
                     },
                 }
             }
@@ -471,13 +577,15 @@ impl Handler for WebSocketServer {
                         self.output_tx.send(InternalMessage::NewClient{client_token: token}).unwrap();
                     },
                     ClientState::Open => {
+                        assert!(client.writing_substate == SubState::Doing);
                         assert!(client.outgoing_messages.len() > 0);
                         match client.outgoing_messages.pop_front() {
                             Some(InternalMessage::Data{client_token: token, format, data}) => {
-                                // client.write_response(OpCode::Text, &mut m.into_bytes());
+                                // FIXME
+                                // client.write_message(OpCode::Text, &mut m.into_bytes());
                             },
                             Some(InternalMessage::CloseClient{client_token: token}) => {
-                                client.write_response(OpCode::Close, &mut vec!());
+                                client.write_message(OpCode::Close, &mut vec!());
                                 client.writing_substate = SubState::Waiting;
                             },
                             Some(InternalMessage::NewClient{client_token: _token}) => unreachable!(),
@@ -496,10 +604,9 @@ impl Handler for WebSocketServer {
                     ClientState::AwaitingHandshake => unreachable!(),
                     ClientState::HandshakeResponse => interest.insert(EventSet::writable()),
                     ClientState::Open => {
-                        interest.insert(EventSet::readable());
                         match client.reading_substate {
                             SubState::Waiting => {},
-                            SubState::Doing   => {},
+                            SubState::Doing   => interest.insert(EventSet::readable()),
                         }
 
                         match client.writing_substate {
@@ -529,12 +636,6 @@ fn main() {
             _ => panic!("123"),
         }
 
-        // disconnect
-        writer.write(InternalMessage::CloseClient{client_token: Token(2)});
-
-        loop {}
-
-        /*
         // Receive
         match reader.bread() {
             InternalMessage::NewClient{client_token: token} => {
@@ -546,7 +647,11 @@ fn main() {
             InternalMessage::Data{client_token: _token, format: _format, data: _data} =>
                 {},
         }
-        */
+
+        // disconnect
+        writer.write(InternalMessage::CloseClient{client_token: Token(2)});
+
+        loop {}
     });
 
     server.start();
