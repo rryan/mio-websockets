@@ -26,6 +26,11 @@ use mio::tcp::*;
 use http_muncher::{Parser, ParserHandler};
 use rustc_serialize::base64::{ToBase64, STANDARD};
 
+enum ReadError {
+    Fatal,
+    Incomplete,
+}
+
 enum InternalMessage {
     NewClient{token: Token},
     CloseClient{token: Token},
@@ -310,25 +315,24 @@ impl WebSocketClient {
         }
     }
 
-    // return none if it's a multiframe message and we aren't on the last frame yet
-    fn read_message(&mut self) -> Option<(OpCode, Vec<u8>)> {
+    fn read_message(&mut self) -> Result<(OpCode, Vec<u8>), ReadError> {
         let (opcode, final_frame) : (OpCode, bool) = match self.read_op_code() {
             None => {
                 println!("bad opcode");
-                return None;
+                return Err(ReadError::Fatal);
             }
             Some((o, ff)) => (o, ff)
         };
 
         if false == final_frame {
-            println!("no support for multiframe messages");
-            return None;
+            println!("multiframe messages unsupported");
+            return Err(ReadError::Incomplete);
         }
 
         let (payload_len,masking):(u64,bool) = match self.read_payload_length_and_masking_bit() {
             None => {
                 println!("bad payload length or masking bit");
-                return None;
+                return Err(ReadError::Fatal);
             }
             Some((len, masking)) => (len, masking)
         };
@@ -343,21 +347,21 @@ impl WebSocketClient {
         // XXX
         if payload_len > (usize::max_value() as u64) {
             println!("payload length too large");
-            return None;
+            return Err(ReadError::Fatal);
         }
 
         let payload_len = payload_len as usize;
         let app_data = match self.read_application_data(payload_len) {
             None => {
                 println!("bad application data");
-                return None;
+                return Err(ReadError::Fatal);
             }
             Some(data) => data
         };
         assert!(app_data.len() == payload_len);
 
         if masking_key.is_none() {
-            return Some((opcode, app_data));
+            return Ok((opcode, app_data));
         }
         let masking_key = masking_key.unwrap();
 
@@ -366,12 +370,17 @@ impl WebSocketClient {
             output.push(app_data[i] ^ masking_key[i % 4]);
         }
 
-        return Some((opcode, output))
+        return Ok((opcode, output))
     }
 
     fn read_op_code(&mut self) -> Option<(OpCode, bool)> {
         let mut buff = Vec::new();
-        std::io::Read::by_ref(&mut self.socket).take(1).read_to_end(&mut buff).unwrap();
+        match std::io::Read::by_ref(&mut self.socket).take(1).read_to_end(&mut buff) {
+            Ok(1)  => {},
+            Ok(_)  => return None,
+            Err(_) => return None,
+        }
+
         let op = match buff[0] & OP_CODE_MASK {
             OP_CONTINUATION => OpCode::Continuation,
             OP_TEXT         => OpCode::Text,
@@ -545,6 +554,11 @@ impl WebSocketServer {
                                 PollOpt::edge()).unwrap();
         event_loop.run(self).unwrap();
     }
+
+    fn close_connection(&mut self, token : Token) {
+        self.clients.remove(&token);
+        self.output_tx.send(InternalMessage::CloseClient{token: token}).unwrap();
+    }
 }
 
 impl Handler for WebSocketServer {
@@ -573,10 +587,8 @@ impl Handler for WebSocketServer {
             return;
         }
 
-        if !(token == self.pipe_token || self.clients.contains_key(&token)) {
-            println!("bad token");
-            return;
-        }
+        // -----------------------------
+        // -----------------------------
 
         let updated_token : Token;
         if token == self.pipe_token {
@@ -609,9 +621,7 @@ impl Handler for WebSocketServer {
                 },
             }
         } else {
-            assert!(self.clients.contains_key(&token));
-
-            if events.is_readable() {
+            if events.is_readable() && self.clients.contains_key(&token) {
                 match self.clients.get_mut(&token).unwrap().state.state {
                     CStates::AwaitingHandshake => {
                         self.clients.get_mut(&token).unwrap().handshake_request();
@@ -619,42 +629,45 @@ impl Handler for WebSocketServer {
                     CStates::HandshakeResponse => unreachable!(),
                     CStates::Open => {
                         println!("GOT MSG");
-                        let mut client = self.clients.get_mut(&token).unwrap();
-                        let msg = client.read_message();
-                        if msg.is_some() {
-                            let (opcode, data) = msg.unwrap();
-                            match im_from_wire(token, opcode, data) {
-                                Some(InternalMessage::Ping{token}) => {
-                                    client.outgoing_messages.push_back(InternalMessage::Pong{token: token});
-                                },
-                                Some(InternalMessage::Pong{token: _}) => {},
-                                Some(InternalMessage::CloseClient{token: _}) => {
-                                    client.state.update_received_close();
-                                },
-                                Some(InternalMessage::NewClient{token: _}) => unreachable!(),
-                                Some(m) => {self.output_tx.send(m).unwrap();},
-                                None => {},
-                            }
+                        match self.clients.get_mut(&token).unwrap().read_message() {
+                            Ok((opcode, data)) => {
+                                let mut client = self.clients.get_mut(&token).unwrap();
+                                match im_from_wire(token, opcode, data) {
+                                    Some(InternalMessage::Ping{token}) => {
+                                        client.outgoing_messages.push_back(InternalMessage::Pong{token: token});
+                                    },
+                                    Some(InternalMessage::Pong{token: _}) => {},
+                                    Some(InternalMessage::CloseClient{token: _}) => {
+                                        client.state.update_received_close();
+                                    },
+                                    Some(InternalMessage::NewClient{token: _}) => unreachable!(),
+                                    Some(m) => {self.output_tx.send(m).unwrap();},
+                                    None => {},
+                                }
+                            },
+                            Err(_) => self.close_connection(token),
                         }
                     },
                     CStates::ReceivedClose => unreachable!(),
                     CStates::SentClose => {
                         let msg = self.clients.get_mut(&token).unwrap().read_message();
-                        if msg.is_some() {
-                            let (opcode, data) = msg.unwrap();
-                            match im_from_wire(token, opcode, data) {
-                                Some(InternalMessage::CloseClient{token}) => {
-                                    // close the socket
-                                    self.clients.remove(&token);
-                                },
-                                _ => {},
-                            }
+                        match msg {
+                            Ok((opcode, data)) => {
+                                match im_from_wire(token, opcode, data) {
+                                    Some(InternalMessage::CloseClient{token}) => {
+                                        self.close_connection(token);
+                                    },
+                                    _ => {},
+                                }
+                            },
+                            Err(_) => self.close_connection(token),
                         }
                     }
                 }
             }
 
-            if events.is_writable() {
+            // We may have deleted the client in the 'readable' block
+            if events.is_writable() && self.clients.contains_key(&token) {
                 match self.clients.get_mut(&token).unwrap().state.state {
                     CStates::AwaitingHandshake => unreachable!(),
                     CStates::HandshakeResponse => {
@@ -689,8 +702,7 @@ impl Handler for WebSocketServer {
                             let client = self.clients.get_mut(&token).unwrap();
                             client.write_message(OpCode::Close, &mut vec!());
                         }
-                        // close the socket
-                        self.clients.remove(&token);
+                        self.close_connection(token);
                     },
                     CStates::SentClose => unreachable!(),
                 }
@@ -706,7 +718,7 @@ impl Handler for WebSocketServer {
                 event_loop.reregister(&client.socket, updated_token, interest,
                               PollOpt::edge() | PollOpt::oneshot()).unwrap();
             },
-            None => {}
+            None => {},
         };
     }
 }
@@ -745,7 +757,7 @@ fn main() {
         writer.write(InternalMessage::TextData{token: Token(2), data: String::from("Yeah!")});
 
         // disconnect
-        writer.write(InternalMessage::CloseClient{token: Token(2)});
+        // writer.write(InternalMessage::CloseClient{token: Token(2)});
 
         loop {}
     });
