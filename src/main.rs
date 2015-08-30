@@ -529,15 +529,14 @@ struct WebSocketServer {
 }
 
 impl WebSocketServer {
-    fn new(_ip: &str, _port: u32) -> (WebSocketServer, InternalReader, InternalWriter) {
+    fn new(ip: &str, port: u16) -> (WebSocketServer, InternalReader, InternalWriter) {
         // i/o wrt to the event loop
         let (p_reader, p_writer)   = unix::pipe().unwrap();
         let (input_tx,  input_rx)  = mpsc::channel();
         let (output_tx, output_rx) = mpsc::channel();
 
-        // FIXME: use ip + port
         let server_socket = TcpSocket::v4().unwrap();
-        let address = FromStr::from_str("0.0.0.0:10000").unwrap();
+        let address = FromStr::from_str(&format!("{}:{}", ip, port)).unwrap();
         server_socket.bind(&address).unwrap();
         let server_socket = server_socket.listen(256).unwrap();
 
