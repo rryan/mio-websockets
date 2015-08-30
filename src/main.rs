@@ -131,16 +131,49 @@ impl ParserHandler for HttpParser {
 
 #[derive(PartialEq)]
 #[derive(Debug)]
-enum ClientState {
+enum CStates {
     AwaitingHandshake,
     HandshakeResponse,
     Open,
 }
 
-#[derive(PartialEq)]
-enum SubState {
-    Waiting,
-    Doing,
+struct ClientState {
+    state: CStates,
+}
+
+impl ClientState {
+    fn new() -> ClientState {
+        ClientState{
+            state: CStates::AwaitingHandshake,
+        }
+    }
+
+    fn update_handshake_response(&mut self) {
+        assert!(self.state == CStates::AwaitingHandshake);
+        self.state = CStates::HandshakeResponse;
+    }
+
+    fn update_open(&mut self) {
+        assert!(self.state == CStates::HandshakeResponse);
+        self.state = CStates::Open;
+    }
+
+    fn interest(&self, outgoing: bool) -> EventSet {
+        let mut interest = EventSet::none();
+
+        match self.state {
+            CStates::AwaitingHandshake => unreachable!(),
+            CStates::HandshakeResponse => interest.insert(EventSet::writable()),
+            CStates::Open => {
+                interest.insert(EventSet::readable());
+                if outgoing {
+                    interest.insert(EventSet::writable());
+                }
+            },
+        }
+
+        interest
+    }
 }
 
 struct WebSocketClient {
@@ -148,8 +181,6 @@ struct WebSocketClient {
     headers: Rc<RefCell<HashMap<String, String>>>,
     http_parser: Parser<HttpParser>,
     state: ClientState,
-    writing_substate: SubState,
-    reading_substate: SubState,
     outgoing_messages: std::collections::LinkedList<InternalMessage>,
 }
 
@@ -164,11 +195,13 @@ impl WebSocketClient {
                 current_key: None,
                 headers: headers.clone()
             }),
-            state: ClientState::AwaitingHandshake,
-            writing_substate: SubState::Waiting,
-            reading_substate: SubState::Waiting,
+            state: ClientState::new(),
             outgoing_messages: std::collections::LinkedList::new(),
         }
+    }
+
+    fn interest(&mut self) -> EventSet {
+        self.state.interest(self.outgoing_messages.len() > 0)
     }
 
     // /////////////////////
@@ -183,6 +216,7 @@ impl WebSocketClient {
                          Sec-WebSocket-Accept: {}\r\n\
                          Upgrade: websocket\r\n\r\n", response_key));
         self.socket.try_write(response.as_bytes()).unwrap();
+        self.state.update_open();
     }
 
     fn write_message(&mut self, op: OpCode, payload: &mut Vec<u8>) {
@@ -249,7 +283,7 @@ impl WebSocketClient {
     // /////////////////////
     //  Reading from Client
     // /////////////////////
-    fn handshake_request(&mut self) -> bool {
+    fn handshake_request(&mut self) {
         loop {
             let mut buf = [0; 2048];
             match self.socket.try_read(&mut buf) {
@@ -258,11 +292,12 @@ impl WebSocketClient {
                 },
                 Ok(None) =>
                     // Socket buffer has got no more bytes.
-                    return false,
+                    panic!("handle this"),
                 Ok(Some(_len)) => {
                     self.http_parser.parse(&buf);
                     if self.http_parser.is_upgrade() {
-                        return true;
+                        self.state.update_handshake_response();
+                        return;
                     }
                 }
             }
@@ -338,7 +373,7 @@ impl WebSocketClient {
             OP_CLOSE        => OpCode::Close,
             OP_PING         => OpCode::Ping,
             OP_PONG         => OpCode::Pong,
-            _ => return None,
+            _               => return None,
         };
 
         Some((op, (buff[0] & FINAL_FRAME_MASK) == FINAL_FRAME_MASK))
@@ -512,61 +547,63 @@ impl Handler for WebSocketServer {
 
     fn ready(&mut self, event_loop: &mut EventLoop<WebSocketServer>,
              token: Token, events: EventSet) {
-        let mut reregister_token : Option<Token> = None;
-        println!("TOKEN: {:?}", token);
-        if events.is_readable() {
-            if token == self.server_token {
-                let client_socket = match self.socket.accept() {
-                    Ok(Some(sock)) => sock,
-                    Ok(None) => unreachable!(),
-                    Err(e) => {
-                        println!("Accept error: {}", e);
-                        return;
-                    }
-                };
+        if token == self.server_token {
+            assert!(events.is_readable());
+            let client_socket = match self.socket.accept() {
+                Ok(Some(sock)) => sock,
+                Ok(None) => unreachable!(),
+                Err(e) => {
+                    println!("Accept error: {}", e);
+                    return;
+                }
+            };
 
-                let new_token = self.counter.next();
-                self.clients.insert(new_token, WebSocketClient::new(client_socket));
+            let new_token = self.counter.next();
+            self.clients.insert(new_token, WebSocketClient::new(client_socket));
 
-                event_loop.register_opt(&self.clients[&new_token].socket,
-                                        new_token, EventSet::readable(),
-                                        PollOpt::edge() | PollOpt::oneshot()).unwrap();
-            } else if token == self.pipe_token {
-                // FIXME: handle a broken pipe (ie, reads zero bytes)
-                self.pipe_reader.by_ref().take(1).read_to_end(&mut Vec::new()).unwrap();
-                let msg = self.input_rx.recv();
-                match msg {
-                    Ok(InternalMessage::NewClient{client_token: _}) => {},
-                    Err(_e) => {},
-                    Ok(InternalMessage::CloseClient{client_token: token}) |
+            event_loop.register_opt(&self.clients[&new_token].socket,
+                                    new_token, EventSet::readable(),
+                                    PollOpt::edge() | PollOpt::oneshot()).unwrap();
+            return;
+        }
+
+        let updated_token : Token;
+        if token == self.pipe_token {
+            assert!(events.is_readable());
+            // FIXME: handle a broken pipe (ie, reads zero bytes)
+            self.pipe_reader.by_ref().take(1).read_to_end(&mut Vec::new()).unwrap();
+            let msg = self.input_rx.recv();
+            match msg {
+                Err(_e) => {return;},
+                Ok(InternalMessage::NewClient{client_token: _}) => {return;},
+                Ok(InternalMessage::CloseClient{client_token: token}) |
                         Ok(InternalMessage::TextData{client_token: token, data: _}) |
                         Ok(InternalMessage::BinaryData{client_token: token, data: _}) => {
-                        match self.clients.get_mut(&token) {
-                            Some(client) => {
-                                if client.state == ClientState::Open {
-                                    client.outgoing_messages.push_back(msg.unwrap());
-                                    client.writing_substate = SubState::Doing;
-                                    reregister_token = Some(token);
-                                }
-                            },
-                            None => println!("tried sending message to non-existent client!"),
-                        }
-                    },
-                }
-            } else {
+                    let client = self.clients.get_mut(&token);
+                    if client.is_none() {
+                        println!("tried sending message to non-existent client!");
+                        return;
+                    }
+
+                    let client = client.unwrap();
+                    if client.state.state != CStates::Open {
+                        println!("wrong client state for sending piped stuff!");
+                        return;
+                    }
+
+                    client.outgoing_messages.push_back(msg.unwrap());
+                    updated_token = token;
+                },
+            }
+        } else {
+            if events.is_readable() {
                 let mut client = self.clients.get_mut(&token).unwrap();
-                match client.state {
-                    ClientState::AwaitingHandshake => {
-                        assert!(client.reading_substate == SubState::Waiting);
-                        if true == client.handshake_request() {
-                            client.state = ClientState::HandshakeResponse;
-                            client.reading_substate = SubState::Doing;
-                            reregister_token = Some(token);
-                        }
+                match client.state.state {
+                    CStates::AwaitingHandshake => {
+                        client.handshake_request();
                     },
-                    ClientState::HandshakeResponse => unreachable!(),
-                    ClientState::Open => {
-                        assert!(client.reading_substate == SubState::Doing);
+                    CStates::HandshakeResponse => unreachable!(),
+                    CStates::Open => {
                         println!("GOT MSG");
                         match client.read_message() {
                             None => {},
@@ -580,22 +617,16 @@ impl Handler for WebSocketServer {
                     },
                 }
             }
-        }
 
-        if events.is_writable() {
-            if token != self.server_token && token != self.pipe_token {
+            if events.is_writable() {
                 let mut client = self.clients.get_mut(&token).unwrap();
-                match client.state {
-                    ClientState::AwaitingHandshake => unreachable!(),
-                    ClientState::HandshakeResponse => {
+                match client.state.state {
+                    CStates::AwaitingHandshake => unreachable!(),
+                    CStates::HandshakeResponse => {
                         client.handshake_response();
-                        client.state      = ClientState::Open;
-                        reregister_token  = Some(token);
-
                         self.output_tx.send(InternalMessage::NewClient{client_token: token}).unwrap();
                     },
-                    ClientState::Open => {
-                        assert!(client.writing_substate == SubState::Doing);
+                    CStates::Open => {
                         assert!(client.outgoing_messages.len() > 0);
                         match client.outgoing_messages.pop_front() {
                             Some(InternalMessage::TextData{client_token: _token, data: _data}) => {
@@ -607,7 +638,6 @@ impl Handler for WebSocketServer {
                             },
                             Some(InternalMessage::CloseClient{client_token: _}) => {
                                 client.write_message(OpCode::Close, &mut vec!());
-                                client.writing_substate = SubState::Waiting;
                             },
                             Some(InternalMessage::NewClient{client_token: _token}) => unreachable!(),
                             None => unreachable!(),
@@ -615,33 +645,14 @@ impl Handler for WebSocketServer {
                     },
                 }
             }
+
+            updated_token = token;
         }
 
-        match reregister_token {
-            Some(token) => {
-                let client = self.clients.get(&token).unwrap();
-                let mut interest = EventSet::none();
-                match client.state {
-                    ClientState::AwaitingHandshake => unreachable!(),
-                    ClientState::HandshakeResponse => interest.insert(EventSet::writable()),
-                    ClientState::Open => {
-                        match client.reading_substate {
-                            SubState::Waiting => {},
-                            SubState::Doing   => interest.insert(EventSet::readable()),
-                        }
-
-                        match client.writing_substate {
-                            SubState::Waiting => {},
-                            SubState::Doing   => interest.insert(EventSet::writable()),
-                        }
-                    }
-                }
-
-                event_loop.reregister(&client.socket, token, interest,
-                                      PollOpt::edge() | PollOpt::oneshot()).unwrap();
-            },
-            None => {},
-        }
+        let client   = self.clients.get_mut(&updated_token).unwrap();
+        let interest = client.interest();
+        event_loop.reregister(&client.socket, updated_token, interest,
+                              PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 }
 
