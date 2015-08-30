@@ -31,6 +31,12 @@ enum ReadError {
     Incomplete,
 }
 
+
+// ####################
+// ####################
+//   Internal Message
+// ####################
+// ####################
 enum InternalMessage {
     NewClient{token: Token},
     CloseClient{token: Token},
@@ -47,27 +53,88 @@ fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalM
                 token: token,
                 data: String::from_utf8(data).unwrap()
             },
-        OpCode::Binary => InternalMessage::BinaryData{token: token, data: data},
-        OpCode::Close => InternalMessage::CloseClient{token: token},
-        OpCode::Ping => InternalMessage::Ping{token: token},
-        OpCode::Pong => InternalMessage::Pong{token: token},
+        OpCode::Binary       => InternalMessage::BinaryData{token: token, data: data},
+        OpCode::Close        => InternalMessage::CloseClient{token: token},
+        OpCode::Ping         => InternalMessage::Ping{token: token},
+        OpCode::Pong         => InternalMessage::Pong{token: token},
         OpCode::Continuation => unreachable!(),
     };
 
     Some(msg)
 }
 
-pub const OP_CODE_MASK: u8 = 0b0000_1111;
-pub const FINAL_FRAME_MASK: u8 = 0b1000_0000;
-pub const MASKING_MASK: u8 = 0b1000_0000;
+struct InternalReader {
+    event_buffer : LinkedList<InternalMessage>,
+    output_rx    : mpsc::Receiver<InternalMessage>,
+}
+
+impl InternalReader {
+    fn new(output_rx: mpsc::Receiver<InternalMessage>) -> InternalReader {
+        InternalReader {
+            event_buffer: LinkedList::new(),
+            output_rx: output_rx,
+        }
+    }
+
+    fn bread(&mut self) -> InternalMessage {
+        if self.event_buffer.len() == 0 {
+            match self.output_rx.recv() {
+                Ok(m)  => self.event_buffer.push_back(m),
+                Err(_) => panic!("whattodo"),
+            }
+        }
+        return self.event_buffer.pop_front().unwrap();
+    }
+
+    fn read(&mut self) -> Option<InternalMessage> {
+        match self.output_rx.try_recv() {
+            Ok(m)  => self.event_buffer.push_back(m),
+            Err(_) => {},
+        }
+
+        self.event_buffer.pop_front()
+    }
+}
+
+struct InternalWriter {
+    pipe_writer : unix::PipeWriter,
+    input_tx    : mpsc::Sender<InternalMessage>,
+}
+
+impl InternalWriter {
+    fn new(pipe_writer: unix::PipeWriter,
+           input_tx: mpsc::Sender<InternalMessage>) -> InternalWriter {
+        InternalWriter {
+            input_tx    : input_tx,
+            pipe_writer : pipe_writer,
+        }
+    }
+
+    fn write(&mut self, msg: InternalMessage) {
+        // FIXME: correct way to handle `poke`?
+        let poke = "a";
+        self.pipe_writer.write(poke.to_string().as_bytes()).unwrap();
+        self.pipe_writer.flush().unwrap();
+        self.input_tx.send(msg).unwrap();
+    }
+}
+
+// ###################
+// ###################
+//      Op Codes
+// ###################
+// ###################
+pub const OP_CODE_MASK:        u8 = 0b0000_1111;
+pub const FINAL_FRAME_MASK:    u8 = 0b1000_0000;
+pub const MASKING_MASK:        u8 = 0b1000_0000;
 pub const PAYLOAD_KEY_UN_MASK: u8 = 0b0111_1111;
 
 pub const OP_CONTINUATION: u8 = 0x0;
-pub const OP_TEXT: u8 = 0x1;
-pub const OP_BINARY: u8 = 0x2;
-pub const OP_CLOSE: u8 = 0x8;
-pub const OP_PING: u8 = 0x9;
-pub const OP_PONG: u8 = 0xA;
+pub const OP_TEXT:         u8 = 0x1;
+pub const OP_BINARY:       u8 = 0x2;
+pub const OP_CLOSE:        u8 = 0x8;
+pub const OP_PING:         u8 = 0x9;
+pub const OP_PONG:         u8 = 0xA;
 
 pub enum OpCode {
     Continuation,
@@ -82,17 +149,23 @@ impl fmt::Display for OpCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             OpCode::Continuation => "Continuation".fmt(f),
-            OpCode::Text => "Text".fmt(f),
-            OpCode::Binary => "Binary".fmt(f),
-            OpCode::Close => "Close".fmt(f),
-            OpCode::Ping => "Ping".fmt(f),
-            OpCode::Pong => "Pong".fmt(f),
+            OpCode::Text         => "Text".fmt(f),
+            OpCode::Binary       => "Binary".fmt(f),
+            OpCode::Close        => "Close".fmt(f),
+            OpCode::Ping         => "Ping".fmt(f),
+            OpCode::Pong         => "Pong".fmt(f),
         }
     }
 }
 
+
+// ###################
+// ###################
+//    HTTP handling
+// ###################
+// ###################
 fn gen_key(key: &String) -> String {
-    let mut m = sha1::Sha1::new();
+    let mut m   = sha1::Sha1::new();
     let mut buf = [0u8; 20];
 
     m.update(key.as_bytes());
@@ -104,8 +177,8 @@ fn gen_key(key: &String) -> String {
 }
 
 struct HttpParser {
-    current_key: Option<String>,
-    headers: Rc<RefCell<HashMap<String, String>>>
+    current_key : Option<String>,
+    headers     : Rc<RefCell<HashMap<String, String>>>
 }
 
 impl ParserHandler for HttpParser {
@@ -126,6 +199,12 @@ impl ParserHandler for HttpParser {
     }
 }
 
+
+// ###################
+// ###################
+//    Client Socket
+// ###################
+// ###################
 #[derive(PartialEq)]
 #[derive(Debug)]
 enum CStates {
@@ -180,7 +259,7 @@ impl ClientState {
                 }
             },
             CStates::ReceivedClose => interest.insert(EventSet::writable()),
-            CStates::SentClose => interest.insert(EventSet::readable()),
+            CStates::SentClose     => interest.insert(EventSet::readable()),
         }
 
         interest
@@ -188,11 +267,11 @@ impl ClientState {
 }
 
 struct WebSocketClient {
-    socket: TcpStream,
-    headers: Rc<RefCell<HashMap<String, String>>>,
-    http_parser: Parser<HttpParser>,
-    state: ClientState,
-    outgoing_messages: std::collections::LinkedList<InternalMessage>,
+    socket            : TcpStream,
+    headers           : Rc<RefCell<HashMap<String, String>>>,
+    http_parser       : Parser<HttpParser>,
+    state             : ClientState,
+    outgoing_messages : std::collections::LinkedList<InternalMessage>,
 }
 
 impl WebSocketClient {
@@ -200,14 +279,14 @@ impl WebSocketClient {
         let headers = Rc::new(RefCell::new(HashMap::new()));
 
         WebSocketClient {
-            socket: socket,
-            headers: headers.clone(),
-            http_parser: Parser::request(HttpParser {
-                current_key: None,
-                headers: headers.clone()
+            socket      : socket,
+            headers     : headers.clone(),
+            http_parser : Parser::request(HttpParser {
+                current_key : None,
+                headers     : headers.clone()
             }),
-            state: ClientState::new(),
-            outgoing_messages: std::collections::LinkedList::new(),
+            state             : ClientState::new(),
+            outgoing_messages : std::collections::LinkedList::new(),
         }
     }
 
@@ -257,6 +336,7 @@ impl WebSocketClient {
         buf.push(op_code | MASKING_MASK);
     }
 
+    // FIXME: clean this thing up
     fn set_payload_info(&self, len: usize, buf: &mut Vec<u8>) {
         if len <= 125 {
             buf.push(len as u8);
@@ -344,7 +424,7 @@ impl WebSocketClient {
 
         // XXX: read extension data
 
-        // XXX
+        // FIXME: do a correct overflow check
         if payload_len > (usize::max_value() as u64) {
             println!("payload length too large");
             return Err(ReadError::Fatal);
@@ -431,77 +511,12 @@ impl WebSocketClient {
     }
 }
 
-struct Counter {
-    value: usize,
-}
 
-impl Counter {
-    fn new() -> Counter {
-        Counter{value:0}
-    }
-
-    fn next(&mut self) -> Token {
-        self.value += 1;
-        return Token(self.value - 1);
-    }
-}
-
-struct InternalReader {
-    event_buffer: LinkedList<InternalMessage>,
-    output_rx: mpsc::Receiver<InternalMessage>,
-}
-
-impl InternalReader {
-    fn new(output_rx: mpsc::Receiver<InternalMessage>) -> InternalReader {
-        InternalReader {
-            event_buffer: LinkedList::new(),
-            output_rx: output_rx,
-        }
-    }
-
-    fn bread(&mut self) -> InternalMessage {
-        if self.event_buffer.len() == 0 {
-            match self.output_rx.recv() {
-                Ok(m)  => self.event_buffer.push_back(m),
-                Err(_) => panic!("whattodo"),
-            }
-        }
-        return self.event_buffer.pop_front().unwrap();
-    }
-
-    fn read(&mut self) -> Option<InternalMessage> {
-        match self.output_rx.try_recv() {
-            Ok(m)  => self.event_buffer.push_back(m),
-            Err(_) => {},
-        }
-
-        self.event_buffer.pop_front()
-    }
-}
-
-struct InternalWriter {
-    pipe_writer: unix::PipeWriter,
-    input_tx: mpsc::Sender<InternalMessage>,
-}
-
-impl InternalWriter {
-    fn new(pipe_writer: unix::PipeWriter,
-           input_tx: mpsc::Sender<InternalMessage>) -> InternalWriter {
-        InternalWriter {
-            input_tx    : input_tx,
-            pipe_writer : pipe_writer,
-        }
-    }
-
-    fn write(&mut self, msg: InternalMessage) {
-        // FIXME: correct way to handle `poke`?
-        let poke = "a";
-        self.pipe_writer.write(poke.to_string().as_bytes()).unwrap();
-        self.pipe_writer.flush().unwrap();
-        self.input_tx.send(msg).unwrap();
-    }
-}
-
+// ####################
+// ####################
+//    Server Socket
+// ####################
+// ####################
 struct WebSocketServer {
     counter: Counter,
     socket: TcpListener,
@@ -722,6 +737,22 @@ impl Handler for WebSocketServer {
         };
     }
 }
+
+struct Counter {
+    value: usize,
+}
+
+impl Counter {
+    fn new() -> Counter {
+        Counter{value:0}
+    }
+
+    fn next(&mut self) -> Token {
+        self.value += 1;
+        return Token(self.value - 1);
+    }
+}
+
 
 fn main() {
     let (mut server, mut reader, mut writer) = WebSocketServer::new("0.0.0.0", 10000);
