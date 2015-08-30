@@ -1,6 +1,5 @@
 /*
  * TODO
- * + handle the half-closed, full-closed states correctly
  * + handle errors, don't unwrap everything
  * + handle multiframe messages
  * + send PING from server
@@ -66,23 +65,11 @@ pub const OP_PING: u8 = 0x9;
 pub const OP_PONG: u8 = 0xA;
 
 pub enum OpCode {
-    /// Continuation frame from last packed
     Continuation,
-
-    /// UTF-8 text data
     Text,
-
-    /// Binary data as u8
     Binary,
-
-    /// Indicates client has closed connection
     Close,
-
-    /// Heartbeat requested from client
     Ping,
-
-    /// Heartbeat response to ping frame
-    /// Can also be sent without a ping request
     Pong,
 }
 
@@ -678,24 +665,23 @@ impl Handler for WebSocketServer {
                         let client = self.clients.get_mut(&token).unwrap();
                         assert!(client.outgoing_messages.len() > 0);
                         match client.outgoing_messages.pop_front().unwrap() {
-                            InternalMessage::TextData{token: _token, data: _data} => {
-                                // FIXME
-                                // client.write_message(OpCode::Text, &mut m.into_bytes());
+                            InternalMessage::TextData{token: _token, data} => {
+                                client.write_message(OpCode::Text, &mut data.into_bytes());
                             },
-                            InternalMessage::BinaryData{token: _token, data: _data} => {
-                                // FIXME
+                            InternalMessage::BinaryData{token: _token, mut data} => {
+                                client.write_message(OpCode::Binary, &mut data);
                             },
                             InternalMessage::CloseClient{token: _} => {
                                 client.write_message(OpCode::Close, &mut vec!());
                                 client.state.update_sent_close();
                             },
-                            InternalMessage::NewClient{token: _} => unreachable!(),
                             InternalMessage::Ping{token: _} => {
-                                // FIXME
+                                client.write_message(OpCode::Ping, &mut vec!());
                             },
                             InternalMessage::Pong{token: _} => {
-                                // FIXME
+                                client.write_message(OpCode::Pong, &mut vec!());
                             },
+                            InternalMessage::NewClient{token: _} => unreachable!(),
                         }
                     },
                     CStates::ReceivedClose => {
@@ -737,7 +723,7 @@ fn main() {
             _ => panic!("123"),
         }
 
-        for _ in 1..6 {
+        for _ in 1..2 {
             // Receive
             match reader.bread() {
                 InternalMessage::NewClient{token} => {
@@ -755,6 +741,8 @@ fn main() {
                 _ => {},
             }
         }
+
+        writer.write(InternalMessage::TextData{token: Token(2), data: String::from("Yeah!")});
 
         // disconnect
         writer.write(InternalMessage::CloseClient{token: Token(2)});
