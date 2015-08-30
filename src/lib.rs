@@ -3,6 +3,7 @@
  * + handle errors, don't unwrap everything
  * + handle multiframe messages
  * + send PING from server
+ * + fix sending code
  */
 extern crate mio;
 extern crate http_muncher;
@@ -16,7 +17,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::fmt;
 use std::sync::mpsc;
-use std::thread;
 use std::str::FromStr;
 use std::io::Read;
 use std::io::Write;
@@ -37,13 +37,14 @@ enum ReadError {
 //   Internal Message
 // ####################
 // ####################
-enum InternalMessage {
+pub enum InternalMessage {
     NewClient{token: Token},
     CloseClient{token: Token},
     TextData{token: Token, data: String},
     BinaryData{token: Token, data: Vec<u8>},
     Ping{token: Token},
     Pong{token: Token},
+    Shutdown,
 }
 
 fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalMessage> {
@@ -63,7 +64,7 @@ fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalM
     Some(msg)
 }
 
-struct InternalReader {
+pub struct InternalReader {
     event_buffer : LinkedList<InternalMessage>,
     output_rx    : mpsc::Receiver<InternalMessage>,
 }
@@ -76,7 +77,7 @@ impl InternalReader {
         }
     }
 
-    fn bread(&mut self) -> InternalMessage {
+    pub fn bread(&mut self) -> InternalMessage {
         if self.event_buffer.len() == 0 {
             match self.output_rx.recv() {
                 Ok(m)  => self.event_buffer.push_back(m),
@@ -86,7 +87,7 @@ impl InternalReader {
         return self.event_buffer.pop_front().unwrap();
     }
 
-    fn read(&mut self) -> Option<InternalMessage> {
+    pub fn read(&mut self) -> Option<InternalMessage> {
         match self.output_rx.try_recv() {
             Ok(m)  => self.event_buffer.push_back(m),
             Err(_) => {},
@@ -96,7 +97,7 @@ impl InternalReader {
     }
 }
 
-struct InternalWriter {
+pub struct InternalWriter {
     pipe_writer : unix::PipeWriter,
     input_tx    : mpsc::Sender<InternalMessage>,
 }
@@ -110,7 +111,7 @@ impl InternalWriter {
         }
     }
 
-    fn write(&mut self, msg: InternalMessage) {
+    pub fn write(&mut self, msg: InternalMessage) {
         // FIXME: correct way to handle `poke`?
         let poke = "a";
         self.pipe_writer.write(poke.to_string().as_bytes()).unwrap();
@@ -486,7 +487,6 @@ impl WebSocketClient {
         let len = match key {
             0 ... 125 => key as u64,
             126  => {
-                // self.socket.by_ref().take(2).read_to_end(&buff);
                 self.socket.read_u16::<byteorder::BigEndian>().unwrap() as u64
             },
             127  => {
@@ -517,19 +517,19 @@ impl WebSocketClient {
 //    Server Socket
 // ####################
 // ####################
-struct WebSocketServer {
-    counter: Counter,
-    socket: TcpListener,
-    clients: HashMap<Token, WebSocketClient>,
-    input_rx: mpsc::Receiver<InternalMessage>,
-    output_tx: mpsc::Sender<InternalMessage>,
-    server_token: Token,
-    pipe_token: Token,
-    pipe_reader: unix::PipeReader,
+pub struct WebSocketServer {
+    counter      : Counter,
+    socket       : TcpListener,
+    clients      : HashMap<Token, WebSocketClient>,
+    input_rx     : mpsc::Receiver<InternalMessage>,
+    output_tx    : mpsc::Sender<InternalMessage>,
+    server_token : Token,
+    pipe_token   : Token,
+    pipe_reader  : unix::PipeReader,
 }
 
 impl WebSocketServer {
-    fn new(ip: &str, port: u16) -> (WebSocketServer, InternalReader, InternalWriter) {
+    pub fn new(ip: &str, port: u16) -> (WebSocketServer, InternalReader, InternalWriter) {
         // i/o wrt to the event loop
         let (p_reader, p_writer)   = unix::pipe().unwrap();
         let (input_tx,  input_rx)  = mpsc::channel();
@@ -556,7 +556,7 @@ impl WebSocketServer {
         InternalWriter::new(p_writer, input_tx))
     }
 
-    fn start(&mut self) {
+    pub fn start(&mut self) {
         let mut event_loop = EventLoop::new().unwrap();
         event_loop.register_opt(&self.socket,
                                 self.server_token,
@@ -633,6 +633,10 @@ impl Handler for WebSocketServer {
                     client.outgoing_messages.push_back(msg.unwrap());
                     updated_token = token;
                 },
+                Ok(InternalMessage::Shutdown) => {
+                    event_loop.shutdown();
+                    return;
+                },
             }
         } else {
             if events.is_readable() && self.clients.contains_key(&token) {
@@ -655,6 +659,7 @@ impl Handler for WebSocketServer {
                                         client.state.update_received_close();
                                     },
                                     Some(InternalMessage::NewClient{token: _}) => unreachable!(),
+                                    Some(InternalMessage::Shutdown) => unreachable!(),
                                     Some(m) => {self.output_tx.send(m).unwrap();},
                                     None => {},
                                 }
@@ -709,6 +714,7 @@ impl Handler for WebSocketServer {
                                 client.write_message(OpCode::Pong, &mut vec!());
                             },
                             InternalMessage::NewClient{token: _} => unreachable!(),
+                            InternalMessage::Shutdown => unreachable!(),
                         }
                     },
                     CStates::ReceivedClose => {
@@ -752,45 +758,3 @@ impl Counter {
     }
 }
 
-
-fn main() {
-    let (mut server, mut reader, mut writer) = WebSocketServer::new("0.0.0.0", 10000);
-
-    thread::spawn(move || {
-        // Wait for new client
-        match reader.bread() {
-            InternalMessage::NewClient{token} => {
-                println!("New Client: {:?}", token);
-            },
-            _ => panic!("123"),
-        }
-
-        for _ in 1..2 {
-            // Receive
-            match reader.bread() {
-                InternalMessage::NewClient{token} => {
-                    println!("New Client: {:?}", token);
-                },
-                InternalMessage::CloseClient{token} => {
-                    println!("Close Client: {:?}", token);
-                },
-                InternalMessage::BinaryData{token: _, data} => {
-                    println!("Binary Data: {:?}", data);
-                },
-                InternalMessage::TextData{token: _, data} => {
-                    println!("Text Data: {:?}", data);
-                },
-                _ => {},
-            }
-        }
-
-        writer.write(InternalMessage::TextData{token: Token(2), data: String::from("Yeah!")});
-
-        // disconnect
-        // writer.write(InternalMessage::CloseClient{token: Token(2)});
-
-        loop {}
-    });
-
-    server.start();
-}
