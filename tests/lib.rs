@@ -59,8 +59,6 @@ fn it_works() {
         }
 
         writer.write(mws::InternalMessage::Shutdown);
-
-        loop {}
     });
 
     thread::spawn(move || {

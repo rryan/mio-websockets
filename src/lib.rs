@@ -768,7 +768,6 @@ impl Handler for WebSocketServer {
                     },
                     CStates::HandshakeResponse => unreachable!(),
                     CStates::Open => {
-                        println!("GOT MSG");
                         match self.clients.get_mut(&token).unwrap().read_message() {
                             Ok((opcode, data)) => {
                                 let mut client = self.clients.get_mut(&token).unwrap();
