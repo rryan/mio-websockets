@@ -3,6 +3,7 @@
  * + handle errors, don't unwrap everything
  * + handle multiframe messages
  * + send PING from server
+ * + handle payloads larger than u16
  */
 extern crate mio;
 extern crate http_muncher;
