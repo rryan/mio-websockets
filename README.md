@@ -1,4 +1,6 @@
 # Rust websockets on mio
+### Examples
++ Check out the tests directory
 
 ### Sources
 + Nathan Sizemore: https://github.com/nathansizemore/websocket-stream
