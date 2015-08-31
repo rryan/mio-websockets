@@ -16,7 +16,6 @@ use std::rc::Rc;
 use std::fmt;
 use std::sync::mpsc;
 use std::str::FromStr;
-use std::io::Read;
 use std::io::Write;
 
 use mio::*;
@@ -112,7 +111,7 @@ impl InternalWriter {
     pub fn write(&mut self, msg: InternalMessage) {
         // FIXME: correct way to handle `poke`?
         let poke = "a";
-        self.pipe_writer.write(poke.to_string().as_bytes()).unwrap();
+        self.pipe_writer.try_write(poke.to_string().as_bytes()).unwrap();
         self.pipe_writer.flush().unwrap();
         self.input_tx.send(msg).unwrap();
     }
@@ -266,7 +265,7 @@ impl ClientState {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum ReadState {
     OpCode,
     PayloadKey,
@@ -306,19 +305,21 @@ impl ReadBuffer {
     }
 
     fn stateful_read(&mut self, socket : &mut TcpStream) -> Result<bool, u8> {
-        let     count = self.remaining;
-        let mut buff  = Vec::new();
-        match std::io::Read::by_ref(socket).take(count).read_to_end(&mut buff) {
-            Ok(n) => {
-                assert!(n as u64 <= count);
+        let     count = self.remaining as usize;
+        let mut buff  = Vec::with_capacity(count);
+        unsafe { buff.set_len(count); }
+        match socket.try_read(&mut buff[..]) {
+            Ok(Some(n)) => {
+                assert!(n <= count);
+                assert!(n == buff.len());
                 for x in buff {
                     self.scratch.push(x);
                 }
 
                 self.remaining -= n as u64;
             },
-            // FIXME: need to actually consider the error type
-            Err(_) => {return Ok(false);}
+            Ok(None) => {return Ok(false);}
+            Err(_) => {return Err(1);}
         };
 
         if self.remaining == 0 {
@@ -441,13 +442,11 @@ impl WebSocketClient {
     }
 
     fn read_message(&mut self) -> Result<(OpCode, Vec<u8>), ReadError> {
+        // println!("STATE: {:?}", self.read_buffer.state);
         if ReadState::OpCode == self.read_buffer.state {
             match self.read_op_code() {
-                None => {
-                    println!("bad opcode");
-                    return Err(ReadError::Fatal);
-                },
-                Some((o, ff)) => {
+                Err(_)            => return Err(ReadError::Fatal),
+                Ok((o, ff)) => {
                     self.read_buffer.opcode      = o;
                     self.read_buffer.final_frame = ff;
                     self.read_buffer.state       = ReadState::PayloadKey;
@@ -462,11 +461,11 @@ impl WebSocketClient {
 
         if ReadState::PayloadKey == self.read_buffer.state {
             match self.read_payload_key() {
-                None => {
+                Err(_) => {
                     println!("bad payload key");
                     return Err(ReadError::Fatal);
                 },
-                Some((key, masking)) => {
+                Ok((key, masking)) => {
                     self.read_buffer.masking     = masking;
                     self.read_buffer.payload_key = key;
 
@@ -509,8 +508,8 @@ impl WebSocketClient {
             }
 
             match self.read_masking_key() {
-                Err(_) => return Err(ReadError::Fatal),
-                Ok(None) => return Err(ReadError::Incomplete),
+                Err(_)      => return Err(ReadError::Fatal),
+                Ok(None)    => return Err(ReadError::Incomplete),
                 Ok(Some(k)) => {
                     self.read_buffer.masking_key = k;
                     self.read_buffer.state       = ReadState::Payload;
@@ -523,8 +522,8 @@ impl WebSocketClient {
 
         if ReadState::Payload == self.read_buffer.state {
             match self.read_application_data() {
-                Err(_) => return Err(ReadError::Fatal),
-                Ok(None) => return Err(ReadError::Incomplete),
+                Err(_)            => return Err(ReadError::Fatal),
+                Ok(None)          => return Err(ReadError::Incomplete),
                 Ok(Some(payload)) => {
                     assert!(payload.len() as u64 == self.read_buffer.payload_len);
                     assert!(self.read_buffer.masking && self.read_buffer.masking_key.len() == 4);
@@ -545,12 +544,12 @@ impl WebSocketClient {
         unreachable!();
     }
 
-    fn read_op_code(&mut self) -> Option<(OpCode, bool)> {
-        let mut buff = Vec::new();
-        match std::io::Read::by_ref(&mut self.socket).take(1).read_to_end(&mut buff) {
-            Ok(1)  => {},
-            Ok(_)  => return None,
-            Err(_) => return None,
+    fn read_op_code(&mut self) -> Result<(OpCode, bool), u8> {
+        let mut buff = [0; 1];
+        match self.socket.try_read(&mut buff) {
+            Ok(Some(1))  => {},
+            Ok(_)        => return Err(1),
+            Err(_)       => return Err(1),
         }
 
         let op = match buff[0] & OP_CODE_MASK {
@@ -560,20 +559,24 @@ impl WebSocketClient {
             OP_CLOSE        => OpCode::Close,
             OP_PING         => OpCode::Ping,
             OP_PONG         => OpCode::Pong,
-            _               => return None,
+            _               => return Err(1),
         };
 
-        Some((op, (buff[0] & FINAL_FRAME_MASK) == FINAL_FRAME_MASK))
+        Ok((op, (buff[0] & FINAL_FRAME_MASK) == FINAL_FRAME_MASK))
     }
 
-    fn read_payload_key(&mut self) -> Option<(u8, bool)> {
-        let mut buff = Vec::new();
-        std::io::Read::by_ref(&mut self.socket).take(1).read_to_end(&mut buff).unwrap();
+    fn read_payload_key(&mut self) -> Result<(u8, bool), u8> {
+        let mut buff = [0; 1];
+        match self.socket.try_read(&mut buff) {
+            Ok(Some(1)) => {},
+            Ok(_)       => return Err(1),
+            Err(_)      => return Err(1),
+        }
 
         let masking : bool = (buff[0] & MASKING_MASK) == MASKING_MASK;
         let key     : u8   = buff[0] & PAYLOAD_KEY_UN_MASK;
 
-        Some((key, masking))
+        Ok((key, masking))
     }
 
     fn read_payload_length(&mut self) -> Result<Option<u64>, u8> {
@@ -730,7 +733,8 @@ impl Handler for WebSocketServer {
         if token == self.pipe_token {
             assert!(events.is_readable());
             // FIXME: handle a broken pipe (ie, reads zero bytes)
-            self.pipe_reader.by_ref().take(1).read_to_end(&mut Vec::new()).unwrap();
+            let mut buff = [0; 1];
+            self.pipe_reader.try_read(&mut buff).unwrap();
             let msg = self.input_rx.recv();
             match msg {
                 Err(_e) => {return;},
