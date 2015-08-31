@@ -12,6 +12,12 @@ fn it_works() {
 
     let text_string = String::from("Hello World"); let text_string2 = text_string.clone();
     let bin_vec = vec![20, 30, 40, 55]; let bin_vec2 = bin_vec.clone();
+    let glyphs = "1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut med_text_string : String = String::new();
+    for _ in 0..(2000/glyphs.len()) {
+        med_text_string.push_str(glyphs);
+    }
+    let med_text_string2 = med_text_string.clone();
     thread::spawn(move || {
         // Wait for new client
         match reader.bread() {
@@ -31,11 +37,21 @@ fn it_works() {
             _ => assert!(false),
         };
 
+        // read medium text message
+        match reader.bread() {
+            mws::InternalMessage::TextData{token: _, data} => assert!(data == med_text_string),
+            _ => assert!(false),
+        };
+
+
         // write small text message
         writer.write(mws::InternalMessage::TextData{token: mio::Token(2), data: text_string});
 
         // write small binary message
         writer.write(mws::InternalMessage::BinaryData{token: mio::Token(2), data: bin_vec});
+
+        // write medium text message
+        // writer.write(mws::InternalMessage::TextData{token: mio::Token(2), data: med_text_string});
 
         match reader.bread() {
             mws::InternalMessage::CloseClient{token: mio::Token(2)} => {},
@@ -43,6 +59,8 @@ fn it_works() {
         }
 
         writer.write(mws::InternalMessage::Shutdown);
+
+        loop {}
     });
 
     thread::spawn(move || {
@@ -55,6 +73,7 @@ fn it_works() {
 
         sender.send_message(websocket::message::Message::Text(text_string2.clone())).unwrap();
         sender.send_message(websocket::message::Message::Binary(bin_vec2.clone())).unwrap();
+        sender.send_message(websocket::message::Message::Text(med_text_string2.clone())).unwrap();
 
         match receiver.recv_message().unwrap() {
             websocket::message::Message::Text(data) => assert!(data == text_string2),
@@ -65,6 +84,17 @@ fn it_works() {
             websocket::message::Message::Binary(data) => assert!(data == bin_vec2),
             _ => assert!(false),
         }
+
+        /*
+        match receiver.recv_message().unwrap() {
+            websocket::message::Message::Text(data) => {
+                println!("DATA: {:?}", data);
+                println!("SRC:  {:?}", med_text_string2);
+                assert!(data == med_text_string2);
+            },
+            _ => assert!(false),
+        }
+        */
     });
 
     server.start();

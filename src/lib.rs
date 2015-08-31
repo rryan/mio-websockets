@@ -9,7 +9,6 @@ extern crate mio;
 extern crate http_muncher;
 extern crate sha1;
 extern crate rustc_serialize;
-extern crate byteorder;
 
 use std::collections::HashMap;
 use std::collections::LinkedList;
@@ -137,6 +136,7 @@ pub const OP_CLOSE:        u8 = 0x8;
 pub const OP_PING:         u8 = 0x9;
 pub const OP_PONG:         u8 = 0xA;
 
+#[derive(Clone)]
 pub enum OpCode {
     Continuation,
     Text,
@@ -267,12 +267,76 @@ impl ClientState {
     }
 }
 
+#[derive(PartialEq)]
+enum ReadState {
+    OpCode,
+    PayloadKey,
+    PayloadLen,
+    Payload,
+    MaskingKey,
+}
+
+struct ReadBuffer {
+    state       : ReadState,
+    opcode      : OpCode,
+    final_frame : bool,
+    payload_key : u8,
+    payload_len : u64,
+    masking     : bool,
+    masking_key : Vec<u8>,
+
+    remaining   : u64,
+    scratch     : Vec<u8>,
+}
+
+impl ReadBuffer {
+    fn new() -> ReadBuffer {
+        ReadBuffer {
+            state     : ReadState::OpCode,
+            remaining : 0,
+            scratch   : Vec::new(),
+
+            // dummy values
+            opcode      : OpCode::Binary,
+            final_frame : false,
+            payload_key : 1,
+            payload_len : 1,
+            masking     : false,
+            masking_key : Vec::new(),
+        }
+    }
+
+    fn stateful_read(&mut self, socket : &mut TcpStream) -> Result<bool, u8> {
+        let     count = self.remaining;
+        let mut buff  = Vec::new();
+        match std::io::Read::by_ref(socket).take(count).read_to_end(&mut buff) {
+            Ok(n) => {
+                assert!(n as u64 <= count);
+                for x in buff {
+                    self.scratch.push(x);
+                }
+
+                self.remaining -= n as u64;
+            },
+            // FIXME: need to actually consider the error type
+            Err(_) => {return Ok(false);}
+        };
+
+        if self.remaining == 0 {
+            return Ok(true);
+        }
+
+        return Ok(false);
+    }
+}
+
 struct WebSocketClient {
     socket            : TcpStream,
     headers           : Rc<RefCell<HashMap<String, String>>>,
     http_parser       : Parser<HttpParser>,
     state             : ClientState,
     outgoing_messages : std::collections::LinkedList<InternalMessage>,
+    read_buffer       : ReadBuffer,
 }
 
 impl WebSocketClient {
@@ -288,6 +352,7 @@ impl WebSocketClient {
             }),
             state             : ClientState::new(),
             outgoing_messages : std::collections::LinkedList::new(),
+            read_buffer       : ReadBuffer::new(),
         }
     }
 
@@ -314,7 +379,7 @@ impl WebSocketClient {
         let mut out_buf: Vec<u8> = Vec::with_capacity(payload.len() + 9);
 
         self.set_op_code(&op, &mut out_buf);
-        self.set_payload_info(payload.len(), &mut out_buf);
+        WebSocketClient::set_payload_info(payload.len(), &mut out_buf);
 
         // TODO - Fix with Vec.append() once stable
         // out_buf.append(payload);
@@ -338,7 +403,7 @@ impl WebSocketClient {
     }
 
     // FIXME: clean this thing up
-    fn set_payload_info(&self, len: usize, buf: &mut Vec<u8>) {
+    fn set_payload_info(len: usize, buf: &mut Vec<u8>) {
         if len <= 125 {
             buf.push(len as u8);
         } else if len <= 65535 {
@@ -397,61 +462,108 @@ impl WebSocketClient {
     }
 
     fn read_message(&mut self) -> Result<(OpCode, Vec<u8>), ReadError> {
-        let (opcode, final_frame) : (OpCode, bool) = match self.read_op_code() {
-            None => {
-                println!("bad opcode");
-                return Err(ReadError::Fatal);
-            }
-            Some((o, ff)) => (o, ff)
-        };
-
-        if false == final_frame {
-            println!("multiframe messages unsupported");
-            return Err(ReadError::Incomplete);
+        if ReadState::OpCode == self.read_buffer.state {
+            match self.read_op_code() {
+                None => {
+                    println!("bad opcode");
+                    return Err(ReadError::Fatal);
+                },
+                Some((o, ff)) => {
+                    self.read_buffer.opcode      = o;
+                    self.read_buffer.final_frame = ff;
+                    self.read_buffer.state       = ReadState::PayloadKey;
+                },
+            };
         }
 
-        let (payload_len,masking):(u64,bool) = match self.read_payload_length_and_masking_bit() {
-            None => {
-                println!("bad payload length or masking bit");
-                return Err(ReadError::Fatal);
-            }
-            Some((len, masking)) => (len, masking)
-        };
-
-        let masking_key = match masking {
-            true  => self.read_masking_key(),
-            false => None,
-        };
-
-        // XXX: read extension data
-
-        // FIXME: do a correct overflow check
-        if payload_len > (usize::max_value() as u64) {
-            println!("payload length too large");
+        if false == self.read_buffer.final_frame {
+            println!("multiframe messages unsupported");
             return Err(ReadError::Fatal);
         }
 
-        let payload_len = payload_len as usize;
-        let app_data = match self.read_application_data(payload_len) {
-            None => {
-                println!("bad application data");
+        if ReadState::PayloadKey == self.read_buffer.state {
+            match self.read_payload_key() {
+                None => {
+                    println!("bad payload key");
+                    return Err(ReadError::Fatal);
+                },
+                Some((key, masking)) => {
+                    self.read_buffer.masking     = masking;
+                    self.read_buffer.payload_key = key;
+
+                    match key {
+                        0 ... 125 => {
+                            self.read_buffer.payload_len = key as u64;
+                            self.read_buffer.state       = ReadState::MaskingKey;
+                            self.read_buffer.remaining   = 4;
+                        },
+                        126 => {
+                            self.read_buffer.state     = ReadState::PayloadLen;
+                            self.read_buffer.remaining = 2;
+                        },
+                        127 => {
+                            self.read_buffer.state     = ReadState::PayloadLen;
+                            self.read_buffer.remaining = 8;
+                        },
+                        _ => unreachable!(),
+                    };
+                },
+            }
+        }
+
+        if ReadState::PayloadLen == self.read_buffer.state {
+            match self.read_payload_length() {
+                Err(_)   => return Err(ReadError::Fatal),
+                Ok(None) => return Err(ReadError::Incomplete),
+                Ok(Some(n)) => {
+                    self.read_buffer.payload_len = n;
+                    self.read_buffer.state       = ReadState::MaskingKey;
+                    self.read_buffer.remaining   = 4;
+                },
+            };
+        }
+
+        if ReadState::MaskingKey == self.read_buffer.state {
+            if self.read_buffer.masking == false {
+                println!("client must use masking key");
                 return Err(ReadError::Fatal);
             }
-            Some(data) => data
-        };
-        assert!(app_data.len() == payload_len);
 
-        if masking_key.is_none() {
-            return Ok((opcode, app_data));
-        }
-        let masking_key = masking_key.unwrap();
-
-        let mut output = Vec::<u8>::with_capacity(payload_len);
-        for i in 0..payload_len {
-            output.push(app_data[i] ^ masking_key[i % 4]);
+            match self.read_masking_key() {
+                Err(_) => return Err(ReadError::Fatal),
+                Ok(None) => return Err(ReadError::Incomplete),
+                Ok(Some(k)) => {
+                    self.read_buffer.masking_key = k;
+                    self.read_buffer.state       = ReadState::Payload;
+                    self.read_buffer.remaining   = self.read_buffer.payload_len;
+                },
+            }
         }
 
-        return Ok((opcode, output))
+        // XXX: read extension data
+
+        if ReadState::Payload == self.read_buffer.state {
+            match self.read_application_data() {
+                Err(_) => return Err(ReadError::Fatal),
+                Ok(None) => return Err(ReadError::Incomplete),
+                Ok(Some(payload)) => {
+                    assert!(payload.len() as u64 == self.read_buffer.payload_len);
+                    assert!(self.read_buffer.masking && self.read_buffer.masking_key.len() == 4);
+
+                    let payload_len = self.read_buffer.payload_len;
+                    let mut output = Vec::<u8>::with_capacity(payload_len as usize);
+                    for i in 0..payload_len {
+                        let i = i as usize;
+                        output.push(payload[i] ^ self.read_buffer.masking_key[i % 4]);
+                    }
+
+                    self.read_buffer.state = ReadState::OpCode;
+                    return Ok((self.read_buffer.opcode.clone(), output));
+                },
+            }
+        }
+
+        unreachable!();
     }
 
     fn read_op_code(&mut self) -> Option<(OpCode, bool)> {
@@ -475,39 +587,70 @@ impl WebSocketClient {
         Some((op, (buff[0] & FINAL_FRAME_MASK) == FINAL_FRAME_MASK))
     }
 
-    fn read_payload_length_and_masking_bit(&mut self) -> Option<(u64, bool)> {
-        use byteorder::ReadBytesExt;
-
+    fn read_payload_key(&mut self) -> Option<(u8, bool)> {
         let mut buff = Vec::new();
         std::io::Read::by_ref(&mut self.socket).take(1).read_to_end(&mut buff).unwrap();
+
         let masking : bool = (buff[0] & MASKING_MASK) == MASKING_MASK;
         let key     : u8   = buff[0] & PAYLOAD_KEY_UN_MASK;
 
-        // network byte order (big endian)
-        let len = match key {
-            0 ... 125 => key as u64,
-            126  => {
-                self.socket.read_u16::<byteorder::BigEndian>().unwrap() as u64
-            },
-            127  => {
-                self.socket.read_u64::<byteorder::BigEndian>().unwrap()
-            },
-            _ => unreachable!(),
+        Some((key, masking))
+    }
+
+    fn read_payload_length(&mut self) -> Result<Option<u64>, u8> {
+        match self.read_buffer.stateful_read(&mut self.socket) {
+            Ok(true)  => {},
+            Ok(false) => return Ok(None),
+            Err(e)    => return Err(e),
+        }
+        assert!(self.read_buffer.remaining == 0);
+
+        // XXX: assumes host is little endian, reading from big endian (network order)
+        if self.read_buffer.payload_key == 126 {
+            assert!(self.read_buffer.scratch.len() == 2);
+            let len : u16 = ((self.read_buffer.scratch[0] as u16) << 8) |
+                (self.read_buffer.scratch[1] as u16);
+            self.read_buffer.scratch.clear();
+            return Ok(Some(len as u64));
+        } else if self.read_buffer.payload_key == 127 {
+            assert!(self.read_buffer.scratch.len() == 8);
+            let mut len = 0u64;
+            for i in (0..8) {
+                len += (self.read_buffer.scratch[i] << (56 - 8*i)) as u64;
+            }
+            self.read_buffer.scratch.clear();
+            return Ok(Some(len));
+        }
+
+        unreachable!();
+    }
+
+    fn read_masking_key(&mut self) -> Result<Option<Vec<u8>>, u8> {
+        match self.read_buffer.stateful_read(&mut self.socket) {
+            Ok(true)  => {},
+            Ok(false) => return Ok(None),
+            Err(e)    => return Err(e),
         };
+        assert!(self.read_buffer.remaining == 0);
+        assert!(self.read_buffer.scratch.len() == 4);
 
-        Some((len, masking))
+        let buff = self.read_buffer.scratch.clone();
+        self.read_buffer.scratch.clear();
+        return Ok(Some(buff));
     }
 
-    fn read_masking_key(&mut self) -> Option<Vec<u8>> {
-        let mut buff = Vec::new();
-        std::io::Read::by_ref(&mut self.socket).take(4).read_to_end(&mut buff).unwrap();
-        return Some(buff);
-    }
+    fn read_application_data(&mut self) -> Result<Option<Vec<u8>>, u8> {
+        match self.read_buffer.stateful_read(&mut self.socket) {
+            Ok(true)  => {},
+            Ok(false) => return Ok(None),
+            Err(e)    => return Err(e),
+        };
+        assert!(self.read_buffer.remaining == 0);
+        assert!(self.read_buffer.scratch.len() as u64 == self.read_buffer.payload_len);
 
-    fn read_application_data(&mut self, len : usize) -> Option<Vec<u8>> {
-        let mut buff = Vec::new();
-        std::io::Read::by_ref(&mut self.socket).take(len as u64).read_to_end(&mut buff).unwrap();
-        return Some(buff);
+        let buff = self.read_buffer.scratch.clone();
+        self.read_buffer.scratch.clear();
+        return Ok(Some(buff));
     }
 }
 
@@ -664,7 +807,8 @@ impl Handler for WebSocketServer {
                                     None => {},
                                 }
                             },
-                            Err(_) => self.close_connection(token),
+                            Err(ReadError::Incomplete) => {},
+                            Err(ReadError::Fatal)      => self.close_connection(token),
                         }
                     },
                     CStates::ReceivedClose => unreachable!(),
@@ -758,3 +902,13 @@ impl Counter {
     }
 }
 
+/*
+#[test]
+fn payload_info_test() {
+    let mut buff: Vec<u8> = Vec::new();
+    WebSocketClient::set_payload_info(1000, &mut buff);
+    for x in buff {
+        println!("{:?}", x);
+    }
+}
+*/
