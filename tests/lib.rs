@@ -91,3 +91,51 @@ fn it_works() {
 
     server.start();
 }
+
+#[test]
+fn multiple_clients() {
+    let (mut server, mut reader, mut writer) = mws::WebSocketServer::new("0.0.0.0", 10001);
+    let text_string = String::from("Hello World");
+    const CLIENT_COUNT : usize = 10;
+
+    thread::spawn(move || {
+        let mut connected = 0;
+        let mut messages  = 0;
+        while messages < CLIENT_COUNT {
+            match reader.bread() {
+                mws::InternalMessage::NewClient{token} => {
+                    assert!(token == mio::Token(connected + 2));
+                    connected += 1;
+                },
+                mws::InternalMessage::TextData{token, data} => {
+                    assert!(token.as_usize() < connected + 2);
+                    assert!(data == text_string);
+                    messages += 1;
+                },
+                _ => assert!(false),
+            }
+        }
+
+        assert!(connected == CLIENT_COUNT);
+        assert!(messages  == CLIENT_COUNT);
+
+        for i in 0..CLIENT_COUNT {
+            writer.write(mws::InternalMessage::CloseClient{token: mio::Token(i+2)});
+        }
+
+        thread::sleep_ms(1000);
+
+        writer.write(mws::InternalMessage::Shutdown);
+    });
+
+    thread::spawn(|| {
+        std::process::Command::new("ruby")
+            .arg("utils/multiple_clients_test.rb")
+            .arg("10001")
+            .arg(format!("{}", CLIENT_COUNT))
+            .output()
+            .unwrap();
+    });
+
+    server.start();
+}
