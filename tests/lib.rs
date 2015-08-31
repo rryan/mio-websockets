@@ -51,7 +51,7 @@ fn it_works() {
         writer.write(mws::InternalMessage::BinaryData{token: mio::Token(2), data: bin_vec});
 
         // write medium text message
-        // writer.write(mws::InternalMessage::TextData{token: mio::Token(2), data: med_text_string});
+        writer.write(mws::InternalMessage::TextData{token: mio::Token(2), data: med_text_string});
 
         match reader.bread() {
             mws::InternalMessage::CloseClient{token: mio::Token(2)} => {},
@@ -85,16 +85,10 @@ fn it_works() {
             _ => assert!(false),
         }
 
-        /*
         match receiver.recv_message().unwrap() {
-            websocket::message::Message::Text(data) => {
-                println!("DATA: {:?}", data);
-                println!("SRC:  {:?}", med_text_string2);
-                assert!(data == med_text_string2);
-            },
+            websocket::message::Message::Text(data) => assert!(data == med_text_string2),
             _ => assert!(false),
         }
-        */
     });
 
     server.start();

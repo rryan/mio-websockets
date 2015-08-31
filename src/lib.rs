@@ -3,7 +3,6 @@
  * + handle errors, don't unwrap everything
  * + handle multiframe messages
  * + send PING from server
- * + fix sending code
  */
 extern crate mio;
 extern crate http_muncher;
@@ -379,7 +378,7 @@ impl WebSocketClient {
         let mut out_buf: Vec<u8> = Vec::with_capacity(payload.len() + 9);
 
         self.set_op_code(&op, &mut out_buf);
-        WebSocketClient::set_payload_info(payload.len(), &mut out_buf);
+        WebSocketClient::set_payload_info(payload.len() as u64, &mut out_buf);
 
         // TODO - Fix with Vec.append() once stable
         // out_buf.append(payload);
@@ -402,38 +401,18 @@ impl WebSocketClient {
         buf.push(op_code | MASKING_MASK);
     }
 
-    // FIXME: clean this thing up
-    fn set_payload_info(len: usize, buf: &mut Vec<u8>) {
+    fn set_payload_info(len: u64, buf: &mut Vec<u8>) {
         if len <= 125 {
             buf.push(len as u8);
         } else if len <= 65535 {
-            let mut len_buf = [0u8; 2];
-            len_buf[0] = (len as u16 & 0b1111_1111u16 << 8) as u8;
-            len_buf[1] = (len as u16 & 0b1111_1111 as u16) as u8;
-
             buf.push(126u8); // 16 bit prelude
-            buf.push(len_buf[0]);
-            buf.push(len_buf[1]);
+            buf.push((len >> 8) as u8);
+            buf.push(len as u8);
         } else {
-            let mut len_buf = [0u8; 8];
-            len_buf[0] = (len as u64 & 0b1111_1111u64 << 56) as u8;
-            len_buf[1] = (len as u64 & 0b1111_1111u64 << 48) as u8;
-            len_buf[2] = (len as u64 & 0b1111_1111u64 << 40) as u8;
-            len_buf[3] = (len as u64 & 0b1111_1111u64 << 32) as u8;
-            len_buf[4] = (len as u64 & 0b1111_1111u64 << 24) as u8;
-            len_buf[5] = (len as u64 & 0b1111_1111u64 << 16) as u8;
-            len_buf[6] = (len as u64 & 0b1111_1111u64 << 8) as u8;
-            len_buf[7] = (len as u64 & 0b1111_1111u64) as u8;
-
             buf.push(127u8); // 64 bit prelude
-            buf.push(len_buf[0]);
-            buf.push(len_buf[1]);
-            buf.push(len_buf[2]);
-            buf.push(len_buf[3]);
-            buf.push(len_buf[4]);
-            buf.push(len_buf[5]);
-            buf.push(len_buf[6]);
-            buf.push(len_buf[7]);
+            for i in (0..8) {
+                buf.push((len >> (56-i*8)) as u8);
+            }
         }
     }
 
@@ -902,13 +881,31 @@ impl Counter {
     }
 }
 
-/*
 #[test]
 fn payload_info_test() {
     let mut buff: Vec<u8> = Vec::new();
-    WebSocketClient::set_payload_info(1000, &mut buff);
-    for x in buff {
-        println!("{:?}", x);
+
+    // small payload
+    WebSocketClient::set_payload_info(10, &mut buff);
+    assert!(buff.len() == 1);
+    assert!(buff[0] == 10);
+
+    // medium payload: 2500 == 00001001 11000100 == 9 196
+    buff.clear();
+    WebSocketClient::set_payload_info(2500, &mut buff);
+    assert!(buff.len() == 3);
+    assert!(buff[0] == 126);
+    assert!(buff[1] == 9);
+    assert!(buff[2] == 196);
+
+    // large payload
+    buff.clear();
+    WebSocketClient::set_payload_info(2u64.pow(63) + 10, &mut buff);
+    assert!(buff.len() == 9);
+    assert!(buff[0] == 127);
+    assert!(buff[1] == 128);
+    for i in 2..8 {
+        assert!(buff[i] == 0);
     }
+    assert!(buff[8] == 10);
 }
-*/
