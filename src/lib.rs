@@ -48,11 +48,16 @@ pub enum InternalMessage {
 
 fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalMessage> {
     let msg = match opcode {
-        OpCode::Text =>
+        OpCode::Text => {
+            let data = match String::from_utf8(data) {
+                Ok(data) => data,
+                Err(_)   => {return None;},
+            };
             InternalMessage::TextData{
                 token: token,
-                data: String::from_utf8(data).unwrap()
-            },
+                data:  data,
+            }
+        },
         OpCode::Binary       => InternalMessage::BinaryData{token: token, data: data},
         OpCode::Close        => InternalMessage::CloseClient{token: token},
         OpCode::Ping         => InternalMessage::Ping{token: token},
@@ -71,8 +76,8 @@ pub struct InternalReader {
 impl InternalReader {
     fn new(output_rx: mpsc::Receiver<InternalMessage>) -> InternalReader {
         InternalReader {
-            event_buffer: LinkedList::new(),
-            output_rx: output_rx,
+            event_buffer : LinkedList::new(),
+            output_rx    : output_rx,
         }
     }
 
@@ -80,9 +85,10 @@ impl InternalReader {
         if self.event_buffer.len() == 0 {
             match self.output_rx.recv() {
                 Ok(m)  => self.event_buffer.push_back(m),
-                Err(_) => panic!("whattodo"),
+                Err(_) => panic!("aborting: Internal channel is broken"),
             }
         }
+        assert!(self.event_buffer.len() > 0);
         return self.event_buffer.pop_front().unwrap();
     }
 
@@ -184,14 +190,26 @@ struct HttpParser {
 
 impl ParserHandler for HttpParser {
     fn on_header_field(&mut self, s: &[u8]) -> bool {
-        self.current_key = Some(std::str::from_utf8(s).unwrap().to_string());
+        match std::str::from_utf8(s) {
+            Ok(s)  => self.current_key = Some(s.to_string()),
+            Err(_) => {},
+        }
+
         true
     }
 
     fn on_header_value(&mut self, s: &[u8]) -> bool {
-        self.headers.borrow_mut()
-            .insert(self.current_key.clone().unwrap(),
-                    std::str::from_utf8(s).unwrap().to_string());
+        if self.current_key.is_some() {
+            match std::str::from_utf8(s) {
+                Ok(s) => {
+                    let key = self.current_key.clone().unwrap();
+                    self.headers.borrow_mut().insert(key, s.to_string());
+                },
+                Err(_) => {},
+            }
+        }
+        self.current_key = None;
+
         true
     }
 
@@ -734,9 +752,14 @@ impl Handler for WebSocketServer {
         let updated_token : Token;
         if token == self.pipe_token {
             assert!(events.is_readable());
-            // FIXME: handle a broken pipe (ie, reads zero bytes)
-            let mut buff = [0; 1];
-            self.pipe_reader.try_read(&mut buff).unwrap();
+            match self.pipe_reader.try_read(&mut [0; 1]) {
+                Ok(Some(1))                     => {},
+                Ok(Some(0)) | Ok(None) | Err(_) => {
+                    panic!("aborting: Error reading from internal pipe!");
+                },
+                Ok(Some(_)) => unreachable!(),
+            }
+
             let msg = self.input_rx.recv();
             match msg {
                 Err(_e) => {return;},
