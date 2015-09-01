@@ -1,6 +1,6 @@
 # Rust websockets on mio
 ### Example Echo Server
-```
+```RUST
 extern crate mio_websockets as mws;
 
 use std::thread;
