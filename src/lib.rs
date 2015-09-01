@@ -19,10 +19,11 @@ use std::sync::mpsc;
 use std::str::FromStr;
 use std::io::Write;
 
-use mio::*;
-use mio::tcp::*;
+use mio::{TryRead, TryWrite, PollOpt, EventSet, EventLoop, Handler, unix, tcp};
 use http_muncher::{Parser, ParserHandler};
 use rustc_serialize::base64::{ToBase64, STANDARD};
+
+pub use mio::Token;
 
 enum ReadError {
     Fatal,
@@ -323,7 +324,7 @@ impl ReadBuffer {
         }
     }
 
-    fn stateful_read(&mut self, socket : &mut TcpStream) -> Result<bool, u8> {
+    fn stateful_read(&mut self, socket : &mut tcp::TcpStream) -> Result<bool, u8> {
         let     count = self.remaining as usize;
         let mut buff  = Vec::with_capacity(count);
         unsafe { buff.set_len(count); }
@@ -350,7 +351,7 @@ impl ReadBuffer {
 }
 
 struct WebSocketClient {
-    socket            : TcpStream,
+    socket            : tcp::TcpStream,
     headers           : Rc<RefCell<HashMap<String, String>>>,
     http_parser       : Parser<HttpParser>,
     state             : ClientState,
@@ -359,7 +360,7 @@ struct WebSocketClient {
 }
 
 impl WebSocketClient {
-    fn new(socket: TcpStream) -> WebSocketClient {
+    fn new(socket: tcp::TcpStream) -> WebSocketClient {
         let headers = Rc::new(RefCell::new(HashMap::new()));
 
         WebSocketClient {
@@ -658,7 +659,7 @@ impl WebSocketClient {
 // ####################
 pub struct WebSocketServer {
     counter      : Counter,
-    socket       : TcpListener,
+    socket       : tcp::TcpListener,
     clients      : HashMap<Token, WebSocketClient>,
     input_rx     : mpsc::Receiver<InternalMessage>,
     output_tx    : mpsc::Sender<InternalMessage>,
@@ -674,7 +675,7 @@ impl WebSocketServer {
         let (input_tx,  input_rx)  = mpsc::channel();
         let (output_tx, output_rx) = mpsc::channel();
 
-        let server_socket = TcpSocket::v4().unwrap();
+        let server_socket = tcp::TcpSocket::v4().unwrap();
         let address = FromStr::from_str(&format!("{}:{}", ip, port)).unwrap();
         server_socket.bind(&address).unwrap();
         let server_socket = server_socket.listen(256).unwrap();
