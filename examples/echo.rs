@@ -1,6 +1,3 @@
-# Rust websockets on mio
-### Example Echo Server
-```
 extern crate mio_websockets as mws;
 
 use std::thread;
@@ -25,9 +22,3 @@ fn main() {
 
     server.start();
 }
-```
-
-### Sources
-+ Nathan Sizemore: https://github.com/nathansizemore/websocket-stream
-+ Nikita Baksalyar: http://nbaksalyar.github.io/2015/07/10/writing-chat-in-rust.html
-  + https://github.com/nbaksalyar/rust-chat
