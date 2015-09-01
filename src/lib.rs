@@ -1,6 +1,5 @@
 /*
  * TODO
- * + handle errors, don't unwrap everything
  * + handle multiframe messages
  * + send PING from server
  * + handle payloads larger than u16
@@ -401,11 +400,7 @@ impl WebSocketClient {
         self.set_op_code(&op, &mut out_buf);
         WebSocketClient::set_payload_info(payload.len() as u64, &mut out_buf);
 
-        // TODO - Fix with Vec.append() once stable
-        // out_buf.append(payload);
-        for byte in payload.iter() {
-            out_buf.push(*byte);
-        }
+        out_buf.extend(payload.iter());
 
         self.socket.try_write(&out_buf).unwrap();
     }
@@ -419,7 +414,7 @@ impl WebSocketClient {
             OpCode::Ping            => OP_PING,
             OpCode::Pong            => OP_PONG
         };
-        buf.push(op_code | MASKING_MASK);
+        buf.push(op_code | FINAL_FRAME_MASK);
     }
 
     fn set_payload_info(len: u64, buf: &mut Vec<u8>) {
@@ -448,7 +443,7 @@ impl WebSocketClient {
                     panic!("Error while reading socket: {:?}", e);
                 },
                 Ok(None) =>
-                    // Socket buffer has got no more bytes.
+                    // FIXME: Socket buffer has got no more bytes.
                     panic!("handle this"),
                 Ok(Some(_len)) => {
                     self.http_parser.parse(&buf);
@@ -462,10 +457,9 @@ impl WebSocketClient {
     }
 
     fn read_message(&mut self) -> Result<(OpCode, Vec<u8>), ReadError> {
-        // println!("STATE: {:?}", self.read_buffer.state);
         if ReadState::OpCode == self.read_buffer.state {
             match self.read_op_code() {
-                Err(_)            => return Err(ReadError::Fatal),
+                Err(_)      => return Err(ReadError::Fatal),
                 Ok((o, ff)) => {
                     self.read_buffer.opcode      = o;
                     self.read_buffer.final_frame = ff;
