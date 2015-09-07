@@ -1,10 +1,3 @@
-/*
- * TODO
- * + handle multiframe messages
- * + send PING from server
- * + handle payloads larger than u16
- * + remove HACKy sleeps from testing
- */
 extern crate mio;
 extern crate http_muncher;
 extern crate sha1;

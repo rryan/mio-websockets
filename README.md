@@ -27,6 +27,12 @@ fn main() {
 }
 ```
 
+### ToDo
++ handle multiframe messages
++ send PING from server
++ handle payloads larger than u16
++ remove HACKy sleeps from testing
+
 ### Sources
 + Nathan Sizemore: https://github.com/nathansizemore/websocket-stream
 + Nikita Baksalyar: http://nbaksalyar.github.io/2015/07/10/writing-chat-in-rust.html
