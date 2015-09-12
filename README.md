@@ -28,9 +28,10 @@ fn main() {
 ```
 
 ### ToDo
-+ handle multiframe messages
++ get more autobahn tests to pass
++ send multiframe messages
 + send PING from server
-+ handle payloads larger than u16
++ handle weirdness (casting) when payload is larger than u16
 + remove HACKy sleeps from testing
 
 ### Sources
