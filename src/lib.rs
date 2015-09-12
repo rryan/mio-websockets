@@ -465,9 +465,15 @@ impl WebSocketClient {
                     self.read_buffer.final_frame = ff;
                     self.read_buffer.state       = ReadState::PayloadKey;
 
+                    // Is the frame violating any protocol rules?
                     if is_control_opcode(&self.read_buffer.opcode) {
                         if false == self.read_buffer.final_frame {
                             println!("Control messages must not be fragmented!");
+                            return Err(ReadError::Fatal);
+                        }
+                    } else {
+                        if self.read_buffer.frames.len() > 0 && self.read_buffer.opcode != OpCode::Continuation {
+                            println!("Subsequent frames in a data message must have opcode == continuation");
                             return Err(ReadError::Fatal);
                         }
                     }
