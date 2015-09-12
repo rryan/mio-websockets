@@ -323,23 +323,18 @@ impl ReadBuffer {
         unsafe { buff.set_len(count); }
         match socket.try_read(&mut buff[..]) {
             Ok(Some(n)) => {
+                assert!(buff.len() == count);
                 assert!(n <= count);
-                assert!(n == buff.len());
-                for x in buff {
-                    self.scratch.push(x);
-                }
+
+                unsafe { buff.set_len(n); }
+                self.scratch.extend(buff.iter());
 
                 self.remaining -= n as u64;
+                return Ok(self.remaining == 0);
             },
             Ok(None) => {return Ok(false);}
             Err(_) => {return Err(1);}
         };
-
-        if self.remaining == 0 {
-            return Ok(true);
-        }
-
-        return Ok(false);
     }
 }
 
@@ -606,7 +601,7 @@ impl WebSocketClient {
             assert!(self.read_buffer.scratch.len() == 8);
             let mut len = 0u64;
             for i in (0..8) {
-                len += (self.read_buffer.scratch[i] << (56 - 8*i)) as u64;
+                len += ((self.read_buffer.scratch[i] as u64) << (56 - 8*i)) as u64;
             }
             self.read_buffer.scratch.clear();
             return Ok(Some(len));
