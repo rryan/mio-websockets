@@ -836,20 +836,21 @@ impl Handler for WebSocketServer {
                     CStates::Open => {
                         match self.clients.get_mut(&token).unwrap().read_message() {
                             Ok((opcode, data)) => {
-                                let mut client = self.clients.get_mut(&token).unwrap();
                                 match im_from_wire(token, opcode, data) {
                                     Some(InternalMessage::Ping{token, data}) => {
                                         let pong = InternalMessage::Pong{token: token, data: data};
+                                        let mut client = self.clients.get_mut(&token).unwrap();
                                         client.outgoing_messages.push_back(pong);
                                     },
                                     Some(InternalMessage::Pong{token: _, data: _}) => {},
                                     Some(InternalMessage::CloseClient{token: _}) => {
+                                        let mut client = self.clients.get_mut(&token).unwrap();
                                         client.state.update_received_close();
                                     },
                                     Some(InternalMessage::NewClient{token: _}) => unreachable!(),
                                     Some(InternalMessage::Shutdown) => unreachable!(),
                                     Some(m) => {self.output_tx.send(m).unwrap();},
-                                    None => {},
+                                    None    => {self.close_connection(token);},
                                 }
                             },
                             Err(ReadError::Incomplete) => {},
