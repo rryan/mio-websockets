@@ -34,8 +34,8 @@ pub enum InternalMessage {
     CloseClient{token: Token},
     TextData{token: Token, data: String},
     BinaryData{token: Token, data: Vec<u8>},
-    Ping{token: Token},
-    Pong{token: Token},
+    Ping{token: Token, data: Vec<u8>},
+    Pong{token: Token, data: Vec<u8>},
     Shutdown,
 }
 
@@ -53,8 +53,8 @@ fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalM
         },
         OpCode::Binary       => InternalMessage::BinaryData{token: token, data: data},
         OpCode::Close        => InternalMessage::CloseClient{token: token},
-        OpCode::Ping         => InternalMessage::Ping{token: token},
-        OpCode::Pong         => InternalMessage::Pong{token: token},
+        OpCode::Ping         => InternalMessage::Ping{token: token, data: data},
+        OpCode::Pong         => InternalMessage::Pong{token: token, data: data},
         OpCode::Continuation => unreachable!(),
     };
 
@@ -135,7 +135,7 @@ pub const OP_CLOSE:        u8 = 0x8;
 pub const OP_PING:         u8 = 0x9;
 pub const OP_PONG:         u8 = 0xA;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum OpCode {
     Continuation,
     Text,
@@ -143,6 +143,13 @@ pub enum OpCode {
     Close,
     Ping,
     Pong,
+}
+
+fn is_control_opcode(opcode : &OpCode) -> bool {
+    match opcode {
+        &OpCode::Close | &OpCode::Ping | &OpCode::Pong => true,
+        _                                              => false,
+    }
 }
 
 impl fmt::Display for OpCode {
@@ -217,8 +224,7 @@ impl ParserHandler for HttpParser {
 //    Client Socket
 // ###################
 // ###################
-#[derive(PartialEq)]
-#[derive(Debug)]
+#[derive(PartialEq, Debug)]
 enum CStates {
     AwaitingHandshake,
     HandshakeResponse,
@@ -298,6 +304,7 @@ struct ReadBuffer {
 
     remaining   : u64,
     scratch     : Vec<u8>,
+    frames      : LinkedList<(OpCode, Vec<u8>)>,
 }
 
 impl ReadBuffer {
@@ -306,6 +313,7 @@ impl ReadBuffer {
             state     : ReadState::OpCode,
             remaining : 0,
             scratch   : Vec::new(),
+            frames    : LinkedList::new(),
 
             // dummy values
             opcode      : OpCode::Binary,
@@ -457,9 +465,11 @@ impl WebSocketClient {
             };
         }
 
-        if false == self.read_buffer.final_frame {
-            println!("multiframe messages unsupported");
-            return Err(ReadError::Fatal);
+        if OpCode::Continuation == self.read_buffer.opcode {
+            if self.read_buffer.frames.len() < 1 {
+                println!("First frame shouldn't be a continuation!");
+                return Err(ReadError::Fatal);
+            }
         }
 
         if ReadState::PayloadKey == self.read_buffer.state {
@@ -504,6 +514,13 @@ impl WebSocketClient {
             };
         }
 
+        if is_control_opcode(&self.read_buffer.opcode) {
+            if self.read_buffer.payload_len > 125 {
+                println!("max payload size for control frames is 125");
+                return Err(ReadError::Fatal);
+            }
+        }
+
         if ReadState::MaskingKey == self.read_buffer.state {
             if self.read_buffer.masking == false {
                 println!("client must use masking key");
@@ -539,7 +556,21 @@ impl WebSocketClient {
                     }
 
                     self.read_buffer.state = ReadState::OpCode;
-                    return Ok((self.read_buffer.opcode.clone(), output));
+                    self.read_buffer.frames.push_back((self.read_buffer.opcode.clone(), output));
+                    // Are we in the middle of a multiframe message?
+                    if false == self.read_buffer.final_frame {
+                        return Err(ReadError::Incomplete);
+                    }
+
+                    // FIXME: a lot of copying
+                    let opcode : OpCode  = self.read_buffer.frames.iter().next().unwrap().0.clone();
+                    let mut output : Vec<u8> = Vec::new();
+                    for _ in 0..self.read_buffer.frames.len() {
+                        let frame = self.read_buffer.frames.pop_front().unwrap();
+                        output.extend(frame.1.iter());
+                    }
+                    self.read_buffer.frames.clear();
+                    return Ok((opcode, output));
                 },
             }
         }
@@ -750,8 +781,8 @@ impl Handler for WebSocketServer {
                 Ok(InternalMessage::CloseClient{token}) |
                         Ok(InternalMessage::TextData{token, data: _}) |
                         Ok(InternalMessage::BinaryData{token, data: _}) |
-                        Ok(InternalMessage::Ping{token}) |
-                        Ok(InternalMessage::Pong{token}) => {
+                        Ok(InternalMessage::Ping{token, data: _}) |
+                        Ok(InternalMessage::Pong{token, data: _}) => {
                     let client = self.clients.get_mut(&token);
                     if client.is_none() {
                         println!("tried sending message to non-existent client!");
@@ -784,10 +815,11 @@ impl Handler for WebSocketServer {
                             Ok((opcode, data)) => {
                                 let mut client = self.clients.get_mut(&token).unwrap();
                                 match im_from_wire(token, opcode, data) {
-                                    Some(InternalMessage::Ping{token}) => {
-                                        client.outgoing_messages.push_back(InternalMessage::Pong{token: token});
+                                    Some(InternalMessage::Ping{token, data}) => {
+                                        let pong = InternalMessage::Pong{token: token, data: data};
+                                        client.outgoing_messages.push_back(pong);
                                     },
-                                    Some(InternalMessage::Pong{token: _}) => {},
+                                    Some(InternalMessage::Pong{token: _, data: _}) => {},
                                     Some(InternalMessage::CloseClient{token: _}) => {
                                         client.state.update_received_close();
                                     },
@@ -841,11 +873,11 @@ impl Handler for WebSocketServer {
                                 client.write_message(OpCode::Close, &mut vec!());
                                 client.state.update_sent_close();
                             },
-                            InternalMessage::Ping{token: _} => {
-                                client.write_message(OpCode::Ping, &mut vec!());
+                            InternalMessage::Ping{token: _, mut data} => {
+                                client.write_message(OpCode::Ping, &mut data);
                             },
-                            InternalMessage::Pong{token: _} => {
-                                client.write_message(OpCode::Pong, &mut vec!());
+                            InternalMessage::Pong{token: _, mut data} => {
+                                client.write_message(OpCode::Pong, &mut data);
                             },
                             InternalMessage::NewClient{token: _} => unreachable!(),
                             InternalMessage::Shutdown => unreachable!(),
