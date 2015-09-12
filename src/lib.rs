@@ -453,6 +453,9 @@ impl WebSocketClient {
         }
     }
 
+    // Control frames can be injected into the middle of fragmented messages.
+    // This means that a successfull return doesn't imply the message that
+    // previously caused a ReadError::Incomplete has finished.
     fn read_message(&mut self) -> Result<(OpCode, Vec<u8>), ReadError> {
         if ReadState::OpCode == self.read_buffer.state {
             match self.read_op_code() {
@@ -461,6 +464,13 @@ impl WebSocketClient {
                     self.read_buffer.opcode      = o;
                     self.read_buffer.final_frame = ff;
                     self.read_buffer.state       = ReadState::PayloadKey;
+
+                    if is_control_opcode(&self.read_buffer.opcode) {
+                        if false == self.read_buffer.final_frame {
+                            println!("Control messages must not be fragmented!");
+                            return Err(ReadError::Fatal);
+                        }
+                    }
                 },
             };
         }
@@ -556,12 +566,19 @@ impl WebSocketClient {
                     }
 
                     self.read_buffer.state = ReadState::OpCode;
+
+                    if is_control_opcode(&self.read_buffer.opcode) {
+                        assert!(true == self.read_buffer.final_frame);
+                        return Ok((self.read_buffer.opcode.clone(), output));
+                    }
+
                     self.read_buffer.frames.push_back((self.read_buffer.opcode.clone(), output));
                     // Are we in the middle of a multiframe message?
                     if false == self.read_buffer.final_frame {
                         return Err(ReadError::Incomplete);
                     }
 
+                    // Handle a completed data message
                     // FIXME: a lot of copying
                     let opcode : OpCode  = self.read_buffer.frames.iter().next().unwrap().0.clone();
                     let mut output : Vec<u8> = Vec::new();
