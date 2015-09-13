@@ -295,12 +295,12 @@ enum ReadState {
 
 struct ReadBuffer {
     state       : ReadState,
-    opcode      : OpCode,
-    final_frame : bool,
-    payload_key : u8,
-    payload_len : u64,
-    masking     : bool,
-    masking_key : Vec<u8>,
+    opcode      : Option<OpCode>,
+    final_frame : Option<bool>,
+    payload_key : Option<u8>,
+    payload_len : Option<u64>,
+    masking     : Option<bool>,
+    masking_key : Option<[u8; 4]>,
 
     remaining   : u64,
     scratch     : Vec<u8>,
@@ -310,19 +310,28 @@ struct ReadBuffer {
 impl ReadBuffer {
     fn new() -> ReadBuffer {
         ReadBuffer {
-            state     : ReadState::OpCode,
-            remaining : 0,
-            scratch   : Vec::new(),
-            frames    : LinkedList::new(),
+            state       : ReadState::OpCode,
+            opcode      : None,
+            final_frame : None,
+            payload_key : None,
+            payload_len : None,
+            masking     : None,
+            masking_key : None,
 
-            // dummy values
-            opcode      : OpCode::Binary,
-            final_frame : false,
-            payload_key : 1,
-            payload_len : 1,
-            masking     : false,
-            masking_key : Vec::new(),
+            remaining   : 0,
+            scratch     : Vec::new(),
+            frames      : LinkedList::new(),
         }
+    }
+
+    fn reset_per_frame_state(&mut self) {
+        self.state       = ReadState::OpCode;
+        self.opcode      = None;
+        self.final_frame = None;
+        self.payload_key = None;
+        self.payload_len = None;
+        self.masking     = None;
+        self.masking_key = None;
     }
 
     fn stateful_read(&mut self, socket : &mut tcp::TcpStream) -> Result<bool, u8> {
@@ -334,6 +343,7 @@ impl ReadBuffer {
                 assert!(buff.len() == count);
                 assert!(n <= count);
 
+                // FIXME: copy
                 unsafe { buff.set_len(n); }
                 self.scratch.extend(buff.iter());
 
@@ -458,21 +468,23 @@ impl WebSocketClient {
     // previously caused a ReadError::Incomplete has finished.
     fn read_message(&mut self) -> Result<(OpCode, Vec<u8>), ReadError> {
         if ReadState::OpCode == self.read_buffer.state {
+            assert!(self.read_buffer.opcode.is_none());
+            assert!(self.read_buffer.final_frame.is_none());
             match self.read_op_code() {
                 Err(_)      => return Err(ReadError::Fatal),
                 Ok((o, ff)) => {
-                    self.read_buffer.opcode      = o;
-                    self.read_buffer.final_frame = ff;
+                    self.read_buffer.opcode      = Some(o);
+                    self.read_buffer.final_frame = Some(ff);
                     self.read_buffer.state       = ReadState::PayloadKey;
 
                     // Is the frame violating any protocol rules?
-                    if is_control_opcode(&self.read_buffer.opcode) {
-                        if false == self.read_buffer.final_frame {
+                    if is_control_opcode(&self.read_buffer.opcode.as_ref().unwrap()) {
+                        if Some(false) == self.read_buffer.final_frame {
                             println!("Control messages must not be fragmented!");
                             return Err(ReadError::Fatal);
                         }
                     } else {
-                        if self.read_buffer.frames.len() > 0 && self.read_buffer.opcode != OpCode::Continuation {
+                        if self.read_buffer.frames.len() > 0 && self.read_buffer.opcode != Some(OpCode::Continuation) {
                             println!("Subsequent frames in a data message must have opcode == continuation");
                             return Err(ReadError::Fatal);
                         }
@@ -480,8 +492,10 @@ impl WebSocketClient {
                 },
             };
         }
+        assert!(self.read_buffer.opcode.is_some());
+        assert!(self.read_buffer.final_frame.is_some());
 
-        if OpCode::Continuation == self.read_buffer.opcode {
+        if Some(OpCode::Continuation) == self.read_buffer.opcode {
             if self.read_buffer.frames.len() < 1 {
                 println!("First frame shouldn't be a continuation!");
                 return Err(ReadError::Fatal);
@@ -489,18 +503,21 @@ impl WebSocketClient {
         }
 
         if ReadState::PayloadKey == self.read_buffer.state {
+            assert!(self.read_buffer.payload_key.is_none());
+            assert!(self.read_buffer.masking.is_none());
             match self.read_payload_key() {
                 Err(_) => {
                     println!("bad payload key");
                     return Err(ReadError::Fatal);
                 },
                 Ok((key, masking)) => {
-                    self.read_buffer.masking     = masking;
-                    self.read_buffer.payload_key = key;
+                    self.read_buffer.masking     = Some(masking);
+                    self.read_buffer.payload_key = Some(key);
 
                     match key {
                         0 ... 125 => {
-                            self.read_buffer.payload_len = key as u64;
+                            assert!(self.read_buffer.payload_len.is_none());
+                            self.read_buffer.payload_len = Some(key as u64);
                             self.read_buffer.state       = ReadState::MaskingKey;
                             self.read_buffer.remaining   = 4;
                         },
@@ -517,28 +534,33 @@ impl WebSocketClient {
                 },
             }
         }
+        assert!(self.read_buffer.masking.is_some());
+        assert!(self.read_buffer.payload_key.is_some());
 
         if ReadState::PayloadLen == self.read_buffer.state {
+            assert!(self.read_buffer.payload_len.is_none());
             match self.read_payload_length() {
-                Err(_)   => return Err(ReadError::Fatal),
-                Ok(None) => return Err(ReadError::Incomplete),
+                Err(_)      => return Err(ReadError::Fatal),
+                Ok(None)    => return Err(ReadError::Incomplete),
                 Ok(Some(n)) => {
-                    self.read_buffer.payload_len = n;
+                    self.read_buffer.payload_len = Some(n);
                     self.read_buffer.state       = ReadState::MaskingKey;
                     self.read_buffer.remaining   = 4;
                 },
             };
         }
+        assert!(self.read_buffer.payload_len.is_some());
 
-        if is_control_opcode(&self.read_buffer.opcode) {
-            if self.read_buffer.payload_len > 125 {
+        if is_control_opcode(&self.read_buffer.opcode.as_ref().unwrap()) {
+            if self.read_buffer.payload_len.unwrap() > 125 {
                 println!("max payload size for control frames is 125");
                 return Err(ReadError::Fatal);
             }
         }
 
         if ReadState::MaskingKey == self.read_buffer.state {
-            if self.read_buffer.masking == false {
+            assert!(self.read_buffer.masking_key.is_none());
+            if self.read_buffer.masking == Some(false) {
                 println!("client must use masking key");
                 return Err(ReadError::Fatal);
             }
@@ -547,12 +569,13 @@ impl WebSocketClient {
                 Err(_)      => return Err(ReadError::Fatal),
                 Ok(None)    => return Err(ReadError::Incomplete),
                 Ok(Some(k)) => {
-                    self.read_buffer.masking_key = k;
+                    self.read_buffer.masking_key = Some(k);
                     self.read_buffer.state       = ReadState::Payload;
-                    self.read_buffer.remaining   = self.read_buffer.payload_len;
+                    self.read_buffer.remaining   = self.read_buffer.payload_len.unwrap();
                 },
             }
         }
+        assert!(self.read_buffer.masking_key.is_some());
 
         // XXX: read extension data
 
@@ -561,39 +584,47 @@ impl WebSocketClient {
                 Err(_)            => return Err(ReadError::Fatal),
                 Ok(None)          => return Err(ReadError::Incomplete),
                 Ok(Some(payload)) => {
-                    assert!(payload.len() as u64 == self.read_buffer.payload_len);
-                    assert!(self.read_buffer.masking && self.read_buffer.masking_key.len() == 4);
+                    assert!(Some(payload.len() as u64) == self.read_buffer.payload_len);
+                    assert!(Some(true) == self.read_buffer.masking);
+                    assert!(self.read_buffer.masking_key.unwrap().len() == 4);
 
-                    let payload_len = self.read_buffer.payload_len;
+                    // FIXME: copy
+                    let payload_len = self.read_buffer.payload_len.unwrap();
                     let mut output = Vec::<u8>::with_capacity(payload_len as usize);
                     for i in 0..payload_len {
                         let i = i as usize;
-                        output.push(payload[i] ^ self.read_buffer.masking_key[i % 4]);
+                        output.push(payload[i] ^ self.read_buffer.masking_key.unwrap()[i % 4]);
                     }
 
-                    self.read_buffer.state = ReadState::OpCode;
+                    // Don't try to access per frame state on read_buffer after reset
+                    let frame_opcode = self.read_buffer.opcode.as_ref().unwrap().clone();
+                    let final_frame  = self.read_buffer.final_frame.as_ref().unwrap().clone();
+                    self.read_buffer.reset_per_frame_state();
 
-                    if is_control_opcode(&self.read_buffer.opcode) {
-                        assert!(true == self.read_buffer.final_frame);
-                        return Ok((self.read_buffer.opcode.clone(), output));
-                    }
+                    if is_control_opcode(&frame_opcode) {
+                        assert!(true == final_frame);
+                        return Ok((frame_opcode, output));
+                    } else {
+                        self.read_buffer.frames.push_back((frame_opcode, output));
 
-                    self.read_buffer.frames.push_back((self.read_buffer.opcode.clone(), output));
-                    // Are we in the middle of a multiframe message?
-                    if false == self.read_buffer.final_frame {
-                        return Err(ReadError::Incomplete);
-                    }
+                        // Are we in the middle of a multiframe message?
+                        if false == final_frame {
+                            return Err(ReadError::Incomplete);
+                        }
 
-                    // Handle a completed data message
-                    // FIXME: a lot of copying
-                    let opcode : OpCode  = self.read_buffer.frames.iter().next().unwrap().0.clone();
-                    let mut output : Vec<u8> = Vec::new();
-                    for _ in 0..self.read_buffer.frames.len() {
-                        let frame = self.read_buffer.frames.pop_front().unwrap();
-                        output.extend(frame.1.iter());
+                        // Handle a completed data message
+                        // FIXME: copy
+                        let opcode : OpCode = self.read_buffer.frames.iter().next().unwrap().0.clone();
+                        let mut output : Vec<u8> = Vec::new();
+                        for _ in 0..self.read_buffer.frames.len() {
+                            let frame = self.read_buffer.frames.pop_front().unwrap();
+                            output.extend(frame.1.iter());
+                        }
+
+                        assert!(self.read_buffer.scratch.is_empty());
+                        self.read_buffer.frames.clear();
+                        return Ok((opcode, output));
                     }
-                    self.read_buffer.frames.clear();
-                    return Ok((opcode, output));
                 },
             }
         }
@@ -645,26 +676,28 @@ impl WebSocketClient {
         assert!(self.read_buffer.remaining == 0);
 
         // XXX: assumes host is little endian, reading from big endian (network order)
-        if self.read_buffer.payload_key == 126 {
-            assert!(self.read_buffer.scratch.len() == 2);
-            let len : u16 = ((self.read_buffer.scratch[0] as u16) << 8) |
-                (self.read_buffer.scratch[1] as u16);
-            self.read_buffer.scratch.clear();
-            return Ok(Some(len as u64));
-        } else if self.read_buffer.payload_key == 127 {
-            assert!(self.read_buffer.scratch.len() == 8);
-            let mut len = 0u64;
-            for i in (0..8) {
-                len += ((self.read_buffer.scratch[i] as u64) << (56 - 8*i)) as u64;
-            }
-            self.read_buffer.scratch.clear();
-            return Ok(Some(len));
+        match self.read_buffer.payload_key {
+            Some(126) => {
+                assert!(self.read_buffer.scratch.len() == 2);
+                let len : u16 = ((self.read_buffer.scratch[0] as u16) << 8) |
+                    (self.read_buffer.scratch[1] as u16);
+                self.read_buffer.scratch.clear();
+                return Ok(Some(len as u64));
+            },
+            Some(127) => {
+                assert!(self.read_buffer.scratch.len() == 8);
+                let mut len = 0u64;
+                for i in (0..8) {
+                    len += ((self.read_buffer.scratch[i] as u64) << (56 - 8*i)) as u64;
+                }
+                self.read_buffer.scratch.clear();
+                return Ok(Some(len));
+            },
+            _ => unreachable!(),
         }
-
-        unreachable!();
     }
 
-    fn read_masking_key(&mut self) -> Result<Option<Vec<u8>>, u8> {
+    fn read_masking_key(&mut self) -> Result<Option<[u8; 4]>, u8> {
         match self.read_buffer.stateful_read(&mut self.socket) {
             Ok(true)  => {},
             Ok(false) => return Ok(None),
@@ -673,9 +706,10 @@ impl WebSocketClient {
         assert!(self.read_buffer.remaining == 0);
         assert!(self.read_buffer.scratch.len() == 4);
 
-        let buff = self.read_buffer.scratch.clone();
+        let key = [self.read_buffer.scratch[0], self.read_buffer.scratch[1],
+                   self.read_buffer.scratch[2], self.read_buffer.scratch[3]];
         self.read_buffer.scratch.clear();
-        return Ok(Some(buff));
+        return Ok(Some(key));
     }
 
     fn read_application_data(&mut self) -> Result<Option<Vec<u8>>, u8> {
@@ -685,8 +719,9 @@ impl WebSocketClient {
             Err(e)    => return Err(e),
         };
         assert!(self.read_buffer.remaining == 0);
-        assert!(self.read_buffer.scratch.len() as u64 == self.read_buffer.payload_len);
+        assert!(Some(self.read_buffer.scratch.len() as u64) == self.read_buffer.payload_len);
 
+        // FIXME: copy
         let buff = self.read_buffer.scratch.clone();
         self.read_buffer.scratch.clear();
         return Ok(Some(buff));
