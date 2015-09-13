@@ -38,12 +38,13 @@ pub enum InternalMessage {
     Shutdown,
 }
 
-fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalMessage> {
+fn im_from_wire(token: &Token, opcode: OpCode, data: Vec<u8>) -> Result<InternalMessage, ReadError> {
+    let token = token.clone();
     let msg = match opcode {
         OpCode::Text => {
             let data = match String::from_utf8(data) {
                 Ok(data) => data,
-                Err(_)   => {return None;},
+                Err(_)   => {return Err(ReadError::Fatal);},
             };
             InternalMessage::TextData{
                 token: token,
@@ -57,7 +58,7 @@ fn im_from_wire(token: Token, opcode: OpCode, data: Vec<u8>) -> Option<InternalM
         OpCode::Continuation => unreachable!(),
     };
 
-    Some(msg)
+    Ok(msg)
 }
 
 pub struct InternalReader {
@@ -456,7 +457,7 @@ impl WebSocketClient {
     // Control frames can be injected into the middle of fragmented messages.
     // This means that a successfull return doesn't imply the message that
     // previously caused a ReadError::Incomplete has finished.
-    fn read_message(&mut self) -> Result<(OpCode, Vec<u8>), ReadError> {
+    fn read_message(&mut self, token: &Token) -> Result<InternalMessage, ReadError> {
         if ReadState::OpCode == self.read_buffer.state {
             assert!(self.read_buffer.opcode.is_none());
             assert!(self.read_buffer.final_frame.is_none());
@@ -593,7 +594,7 @@ impl WebSocketClient {
 
                     if is_control_opcode(&frame_opcode) {
                         assert!(true == final_frame);
-                        return Ok((frame_opcode, output));
+                        return im_from_wire(token, frame_opcode, output);
                     } else {
                         self.read_buffer.frames.push_back((frame_opcode, output));
 
@@ -613,7 +614,7 @@ impl WebSocketClient {
 
                         assert!(self.read_buffer.scratch.is_empty());
                         self.read_buffer.frames.clear();
-                        return Ok((opcode, output));
+                        return im_from_wire(token, opcode, output);
                     }
                 },
             }
@@ -816,8 +817,8 @@ impl Handler for WebSocketServer {
             assert!(events.is_readable());
             let client_socket = match self.socket.accept() {
                 Ok(Some(sock)) => sock,
-                Ok(None) => unreachable!(),
-                Err(e) => {
+                Ok(None)       => unreachable!(),
+                Err(e)         => {
                     println!("Accept error: {}", e);
                     return;
                 }
@@ -839,43 +840,32 @@ impl Handler for WebSocketServer {
                 },
                 CStates::HandshakeResponse => unreachable!(),
                 CStates::Open => {
-                    match self.clients.get_mut(&token).unwrap().read_message() {
-                        Ok((opcode, data)) => {
-                            match im_from_wire(token, opcode, data) {
-                                Some(InternalMessage::Ping{token, data}) => {
-                                    let pong = InternalMessage::Pong{token: token, data: data};
-                                    let mut client = self.clients.get_mut(&token).unwrap();
-                                    client.outgoing_messages.push_back(pong);
-                                },
-                                Some(InternalMessage::Pong{token: _, data: _}) => {},
-                                Some(InternalMessage::CloseClient{token: _}) => {
-                                    let mut client = self.clients.get_mut(&token).unwrap();
-                                    client.state.update_received_close();
-                                },
-                                Some(InternalMessage::NewClient{token: _}) => unreachable!(),
-                                Some(InternalMessage::Shutdown) => unreachable!(),
-                                Some(m) => {self.output_tx.send(m).unwrap();},
-                                None    => {self.close_connection(token);},
-                            }
+                    match self.clients.get_mut(&token).unwrap().read_message(&token) {
+                        Ok(InternalMessage::Ping{token, data}) => {
+                            let pong = InternalMessage::Pong{token: token, data: data};
+                            let mut client = self.clients.get_mut(&token).unwrap();
+                            client.outgoing_messages.push_back(pong);
                         },
+                        Ok(InternalMessage::Pong{token: _, data: _}) => {},
+                        Ok(InternalMessage::CloseClient{token: _}) => {
+                            let mut client = self.clients.get_mut(&token).unwrap();
+                            client.state.update_received_close();
+                        },
+                        Ok(InternalMessage::NewClient{token: _}) => unreachable!(),
+                        Ok(InternalMessage::Shutdown) => unreachable!(),
+                        Ok(m) => {self.output_tx.send(m).unwrap();},
                         Err(ReadError::Incomplete) => {},
                         Err(ReadError::Fatal)      => self.close_connection(token),
                     }
                 },
                 CStates::ReceivedClose => unreachable!(),
                 CStates::SentClose => {
-                    match self.clients.get_mut(&token).unwrap().read_message() {
-                        Ok((opcode, data)) => {
-                            match im_from_wire(token, opcode, data) {
-                                Some(InternalMessage::CloseClient{token}) => {
-                                    self.close_connection(token);
-                                },
-                                _ => {},
-                            }
-                        },
+                    match self.clients.get_mut(&token).unwrap().read_message(&token) {
+                        Ok(InternalMessage::CloseClient{token}) => self.close_connection(token),
+                        Ok(_)  => {},
                         Err(_) => self.close_connection(token),
                     }
-                }
+                },
             }
         }
 
