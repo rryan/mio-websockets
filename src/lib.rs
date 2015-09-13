@@ -10,9 +10,8 @@ use std::rc::Rc;
 use std::fmt;
 use std::sync::mpsc;
 use std::str::FromStr;
-use std::io::Write;
 
-use mio::{TryRead, TryWrite, PollOpt, EventSet, EventLoop, Handler, unix, tcp};
+use mio::{TryRead, TryWrite, PollOpt, EventSet, EventLoop, Handler, tcp};
 use http_muncher::{Parser, ParserHandler};
 use rustc_serialize::base64::{ToBase64, STANDARD};
 
@@ -96,24 +95,15 @@ impl InternalReader {
 }
 
 pub struct InternalWriter {
-    pipe_writer : unix::PipeWriter,
-    input_tx    : mpsc::Sender<InternalMessage>,
+    input_tx : mio::Sender<InternalMessage>,
 }
 
 impl InternalWriter {
-    fn new(pipe_writer: unix::PipeWriter,
-           input_tx: mpsc::Sender<InternalMessage>) -> InternalWriter {
-        InternalWriter {
-            input_tx    : input_tx,
-            pipe_writer : pipe_writer,
-        }
+    fn new(input_tx: mio::Sender<InternalMessage>) -> InternalWriter {
+        InternalWriter {input_tx : input_tx}
     }
 
     pub fn write(&mut self, msg: InternalMessage) {
-        // FIXME: correct way to handle `poke`?
-        let poke = "a";
-        self.pipe_writer.try_write(poke.to_string().as_bytes()).unwrap();
-        self.pipe_writer.flush().unwrap();
         self.input_tx.send(msg).unwrap();
     }
 }
@@ -738,18 +728,13 @@ pub struct WebSocketServer {
     counter      : Counter,
     socket       : tcp::TcpListener,
     clients      : HashMap<Token, WebSocketClient>,
-    input_rx     : mpsc::Receiver<InternalMessage>,
     output_tx    : mpsc::Sender<InternalMessage>,
     server_token : Token,
-    pipe_token   : Token,
-    pipe_reader  : unix::PipeReader,
+    event_loop   : Option<EventLoop<WebSocketServer>>,
 }
 
 impl WebSocketServer {
     pub fn new(ip: &str, port: u16) -> (WebSocketServer, InternalReader, InternalWriter) {
-        // i/o wrt to the event loop
-        let (p_reader, p_writer)   = unix::pipe().unwrap();
-        let (input_tx,  input_rx)  = mpsc::channel();
         let (output_tx, output_rx) = mpsc::channel();
 
         let server_socket = tcp::TcpSocket::v4().unwrap();
@@ -758,32 +743,29 @@ impl WebSocketServer {
         let server_socket = server_socket.listen(256).unwrap();
 
         let mut counter = Counter::new();
+        let server_token = counter.next();
+
+        let mut event_loop = EventLoop::new().unwrap();
+        event_loop.register_opt(&server_socket, server_token,
+                                EventSet::readable(), PollOpt::edge()).unwrap();
+        let channel = event_loop.channel();
 
         (WebSocketServer {
-            clients:        HashMap::new(),
-            socket:         server_socket,
-            input_rx:       input_rx,
-            output_tx:      output_tx,
-            server_token:   counter.next(),
-            pipe_token:     counter.next(),
-            counter:        counter,
-            pipe_reader:    p_reader,
+            clients       : HashMap::new(),
+            socket        : server_socket,
+            output_tx     : output_tx,
+            server_token  : server_token,
+            counter       : counter,
+            event_loop    : Some(event_loop),
         },
         InternalReader::new(output_rx),
-        InternalWriter::new(p_writer, input_tx))
+        InternalWriter::new(channel))
+
     }
 
     pub fn start(&mut self) {
-        let mut event_loop = EventLoop::new().unwrap();
-        event_loop.register_opt(&self.socket,
-                                self.server_token,
-                                EventSet::readable(),
-                                PollOpt::edge()).unwrap();
-        event_loop.register_opt(&self.pipe_reader,
-                                self.pipe_token,
-                                EventSet::readable(),
-                                PollOpt::edge()).unwrap();
-        event_loop.run(self).unwrap();
+        let event_loop = std::mem::replace(&mut self.event_loop, None);
+        event_loop.unwrap().run(self).unwrap();
     }
 
     fn close_connection(&mut self, token : Token) {
@@ -794,7 +776,39 @@ impl WebSocketServer {
 
 impl Handler for WebSocketServer {
     type Timeout = usize;
-    type Message = ();
+    type Message = InternalMessage;
+
+    fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: Self::Message) {
+        match msg {
+            InternalMessage::NewClient{token: _} => {
+                println!("Writing NewClient to the server has no affect!");
+            },
+            InternalMessage::CloseClient{token} |
+                    InternalMessage::TextData{token, data: _} |
+                    InternalMessage::BinaryData{token, data: _} |
+                    InternalMessage::Ping{token, data: _} |
+                    InternalMessage::Pong{token, data: _} => {
+                let client = self.clients.get_mut(&token);
+                if client.is_none() {
+                    println!("tried sending message to non-existent client!");
+                    return;
+                }
+
+                let client = client.unwrap();
+                if client.state.state != CStates::Open {
+                    println!("wrong client state for sending piped stuff!");
+                    return;
+                }
+
+                client.outgoing_messages.push_back(msg);
+
+                let interest = client.interest();
+                event_loop.reregister(&client.socket, token, interest,
+                    PollOpt::edge() | PollOpt::oneshot()).unwrap();
+            },
+            InternalMessage::Shutdown => event_loop.shutdown(),
+        }
+    }
 
     fn ready(&mut self, event_loop: &mut EventLoop<WebSocketServer>,
              token: Token, events: EventSet) {
@@ -818,153 +832,102 @@ impl Handler for WebSocketServer {
             return;
         }
 
-        // -----------------------------
-        // -----------------------------
-
-        let updated_token : Token;
-        if token == self.pipe_token {
-            assert!(events.is_readable());
-            match self.pipe_reader.try_read(&mut [0; 1]) {
-                Ok(Some(1))                     => {},
-                Ok(Some(0)) | Ok(None) | Err(_) => {
-                    panic!("aborting: Error reading from internal pipe!");
+        if events.is_readable() && self.clients.contains_key(&token) {
+            match self.clients.get_mut(&token).unwrap().state.state {
+                CStates::AwaitingHandshake => {
+                    self.clients.get_mut(&token).unwrap().handshake_request();
                 },
-                Ok(Some(_)) => unreachable!(),
-            }
-
-            let msg = self.input_rx.recv();
-            match msg {
-                Err(_e) => {return;},
-                Ok(InternalMessage::NewClient{token: _}) => {return;},
-                Ok(InternalMessage::CloseClient{token}) |
-                        Ok(InternalMessage::TextData{token, data: _}) |
-                        Ok(InternalMessage::BinaryData{token, data: _}) |
-                        Ok(InternalMessage::Ping{token, data: _}) |
-                        Ok(InternalMessage::Pong{token, data: _}) => {
-                    let client = self.clients.get_mut(&token);
-                    if client.is_none() {
-                        println!("tried sending message to non-existent client!");
-                        return;
+                CStates::HandshakeResponse => unreachable!(),
+                CStates::Open => {
+                    match self.clients.get_mut(&token).unwrap().read_message() {
+                        Ok((opcode, data)) => {
+                            match im_from_wire(token, opcode, data) {
+                                Some(InternalMessage::Ping{token, data}) => {
+                                    let pong = InternalMessage::Pong{token: token, data: data};
+                                    let mut client = self.clients.get_mut(&token).unwrap();
+                                    client.outgoing_messages.push_back(pong);
+                                },
+                                Some(InternalMessage::Pong{token: _, data: _}) => {},
+                                Some(InternalMessage::CloseClient{token: _}) => {
+                                    let mut client = self.clients.get_mut(&token).unwrap();
+                                    client.state.update_received_close();
+                                },
+                                Some(InternalMessage::NewClient{token: _}) => unreachable!(),
+                                Some(InternalMessage::Shutdown) => unreachable!(),
+                                Some(m) => {self.output_tx.send(m).unwrap();},
+                                None    => {self.close_connection(token);},
+                            }
+                        },
+                        Err(ReadError::Incomplete) => {},
+                        Err(ReadError::Fatal)      => self.close_connection(token),
                     }
-
-                    let client = client.unwrap();
-                    if client.state.state != CStates::Open {
-                        println!("wrong client state for sending piped stuff!");
-                        return;
-                    }
-
-                    client.outgoing_messages.push_back(msg.unwrap());
-                    updated_token = token;
                 },
-                Ok(InternalMessage::Shutdown) => {
-                    event_loop.shutdown();
-                    return;
-                },
-            }
-        } else {
-            if events.is_readable() && self.clients.contains_key(&token) {
-                match self.clients.get_mut(&token).unwrap().state.state {
-                    CStates::AwaitingHandshake => {
-                        self.clients.get_mut(&token).unwrap().handshake_request();
-                    },
-                    CStates::HandshakeResponse => unreachable!(),
-                    CStates::Open => {
-                        match self.clients.get_mut(&token).unwrap().read_message() {
-                            Ok((opcode, data)) => {
-                                match im_from_wire(token, opcode, data) {
-                                    Some(InternalMessage::Ping{token, data}) => {
-                                        let pong = InternalMessage::Pong{token: token, data: data};
-                                        let mut client = self.clients.get_mut(&token).unwrap();
-                                        client.outgoing_messages.push_back(pong);
-                                    },
-                                    Some(InternalMessage::Pong{token: _, data: _}) => {},
-                                    Some(InternalMessage::CloseClient{token: _}) => {
-                                        let mut client = self.clients.get_mut(&token).unwrap();
-                                        client.state.update_received_close();
-                                    },
-                                    Some(InternalMessage::NewClient{token: _}) => unreachable!(),
-                                    Some(InternalMessage::Shutdown) => unreachable!(),
-                                    Some(m) => {self.output_tx.send(m).unwrap();},
-                                    None    => {self.close_connection(token);},
-                                }
-                            },
-                            Err(ReadError::Incomplete) => {},
-                            Err(ReadError::Fatal)      => self.close_connection(token),
-                        }
-                    },
-                    CStates::ReceivedClose => unreachable!(),
-                    CStates::SentClose => {
-                        let msg = self.clients.get_mut(&token).unwrap().read_message();
-                        match msg {
-                            Ok((opcode, data)) => {
-                                match im_from_wire(token, opcode, data) {
-                                    Some(InternalMessage::CloseClient{token}) => {
-                                        self.close_connection(token);
-                                    },
-                                    _ => {},
-                                }
-                            },
-                            Err(_) => self.close_connection(token),
-                        }
+                CStates::ReceivedClose => unreachable!(),
+                CStates::SentClose => {
+                    match self.clients.get_mut(&token).unwrap().read_message() {
+                        Ok((opcode, data)) => {
+                            match im_from_wire(token, opcode, data) {
+                                Some(InternalMessage::CloseClient{token}) => {
+                                    self.close_connection(token);
+                                },
+                                _ => {},
+                            }
+                        },
+                        Err(_) => self.close_connection(token),
                     }
                 }
             }
+        }
 
-            // We may have deleted the client in the 'readable' block
-            if events.is_writable() && self.clients.contains_key(&token) {
-                match self.clients.get_mut(&token).unwrap().state.state {
-                    CStates::AwaitingHandshake => unreachable!(),
-                    CStates::HandshakeResponse => {
-                        self.clients.get_mut(&token).unwrap().handshake_response();
-                        self.output_tx.send(InternalMessage::NewClient{token: token}).unwrap();
-                    },
-                    CStates::Open => {
-                        let client = self.clients.get_mut(&token).unwrap();
-                        assert!(client.outgoing_messages.len() > 0);
-                        match client.outgoing_messages.pop_front().unwrap() {
-                            InternalMessage::TextData{token: _token, data} => {
-                                client.write_message(OpCode::Text, &mut data.into_bytes());
-                            },
-                            InternalMessage::BinaryData{token: _token, mut data} => {
-                                client.write_message(OpCode::Binary, &mut data);
-                            },
-                            InternalMessage::CloseClient{token: _} => {
-                                client.write_message(OpCode::Close, &mut vec!());
-                                client.state.update_sent_close();
-                            },
-                            InternalMessage::Ping{token: _, mut data} => {
-                                client.write_message(OpCode::Ping, &mut data);
-                            },
-                            InternalMessage::Pong{token: _, mut data} => {
-                                client.write_message(OpCode::Pong, &mut data);
-                            },
-                            InternalMessage::NewClient{token: _} => unreachable!(),
-                            InternalMessage::Shutdown => unreachable!(),
-                        }
-                    },
-                    CStates::ReceivedClose => {
-                        {
-                            let client = self.clients.get_mut(&token).unwrap();
+        // We may have deleted the client in the 'readable' block
+        if events.is_writable() && self.clients.contains_key(&token) {
+            match self.clients.get_mut(&token).unwrap().state.state {
+                CStates::AwaitingHandshake => unreachable!(),
+                CStates::HandshakeResponse => {
+                    self.clients.get_mut(&token).unwrap().handshake_response();
+                    self.output_tx.send(InternalMessage::NewClient{token: token}).unwrap();
+                },
+                CStates::Open => {
+                    let client = self.clients.get_mut(&token).unwrap();
+                    assert!(client.outgoing_messages.len() > 0);
+                    match client.outgoing_messages.pop_front().unwrap() {
+                        InternalMessage::TextData{token: _token, data} => {
+                            client.write_message(OpCode::Text, &mut data.into_bytes());
+                        },
+                        InternalMessage::BinaryData{token: _token, mut data} => {
+                            client.write_message(OpCode::Binary, &mut data);
+                        },
+                        InternalMessage::CloseClient{token: _} => {
                             client.write_message(OpCode::Close, &mut vec!());
-                        }
-                        self.close_connection(token);
-                    },
-                    CStates::SentClose => unreachable!(),
-                }
+                            client.state.update_sent_close();
+                        },
+                        InternalMessage::Ping{token: _, mut data} => {
+                            client.write_message(OpCode::Ping, &mut data);
+                        },
+                        InternalMessage::Pong{token: _, mut data} => {
+                            client.write_message(OpCode::Pong, &mut data);
+                        },
+                        InternalMessage::NewClient{token: _} => unreachable!(),
+                        InternalMessage::Shutdown => unreachable!(),
+                    }
+                },
+                CStates::ReceivedClose => {
+                    {
+                        let client = self.clients.get_mut(&token).unwrap();
+                        client.write_message(OpCode::Close, &mut vec!());
+                    }
+                    self.close_connection(token);
+                },
+                CStates::SentClose => unreachable!(),
             }
-
-            updated_token = token;
         }
 
         // We may have just closed the connection
-        match self.clients.get_mut(&updated_token) {
-            Some(client) => {
-                let interest = client.interest();
-                event_loop.reregister(&client.socket, updated_token, interest,
-                              PollOpt::edge() | PollOpt::oneshot()).unwrap();
-            },
-            None => {},
-        };
+        if let Some(client) = self.clients.get_mut(&token) {
+            let interest = client.interest();
+            event_loop.reregister(&client.socket, token, interest,
+                PollOpt::edge() | PollOpt::oneshot()).unwrap();
+        }
     }
 }
 
