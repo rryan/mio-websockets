@@ -95,6 +95,7 @@ impl InternalReader {
     }
 }
 
+#[derive(Clone)]
 pub struct InternalWriter {
     input_tx : mio::Sender<InternalMessage>,
 }
@@ -963,4 +964,17 @@ fn payload_info_test() {
         assert!(buff[i] == 0);
     }
     assert!(buff[8] == 10);
+}
+
+#[test]
+fn writer_usability_test() {
+    let (_, _, writer) = WebSocketServer::new("0.0.0.0", 9001);
+
+    // is clonable?
+    let clonable = writer.clone();
+
+    // is thread movable?
+    std::thread::spawn(move || {
+        let _ = clonable.clone();
+    });
 }

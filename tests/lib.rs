@@ -19,9 +19,10 @@ fn it_works() {
     }
     let med_text_string2 = med_text_string.clone();
     thread::spawn(move || {
+        let client_token = mio::Token(1);
         // Wait for new client
         match reader.bread() {
-            mws::InternalMessage::NewClient{token} => assert!(token == mio::Token(2)),
+            mws::InternalMessage::NewClient{token} => assert!(token == client_token),
             _ => assert!(false),
         };
 
@@ -45,16 +46,16 @@ fn it_works() {
 
 
         // write small text message
-        writer.write(mws::InternalMessage::TextData{token: mio::Token(2), data: text_string});
+        writer.write(mws::InternalMessage::TextData{token: client_token, data: text_string});
 
         // write small binary message
-        writer.write(mws::InternalMessage::BinaryData{token: mio::Token(2), data: bin_vec});
+        writer.write(mws::InternalMessage::BinaryData{token: client_token, data: bin_vec});
 
         // write medium text message
-        writer.write(mws::InternalMessage::TextData{token: mio::Token(2), data: med_text_string});
+        writer.write(mws::InternalMessage::TextData{token: client_token, data: med_text_string});
 
         match reader.bread() {
-            mws::InternalMessage::CloseClient{token: mio::Token(2)} => {},
+            mws::InternalMessage::CloseClient{token: mio::Token(1)} => {},
             _ => assert!(false),
         }
 
@@ -104,11 +105,11 @@ fn multiple_clients() {
         while messages < CLIENT_COUNT {
             match reader.bread() {
                 mws::InternalMessage::NewClient{token} => {
-                    assert!(token == mio::Token(connected + 2));
+                    assert!(token == mio::Token(connected + 1));
                     connected += 1;
                 },
                 mws::InternalMessage::TextData{token, data} => {
-                    assert!(token.as_usize() < connected + 2);
+                    assert!(token.as_usize() < connected + 1);
                     assert!(data == text_string);
                     messages += 1;
                 },

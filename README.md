@@ -29,10 +29,12 @@ fn main() {
 
 ### ToDo
 + get more autobahn tests to pass
+  + (3, 9, 12, 13)
 + send multiframe messages
 + send PING from server
 + handle weirdness (casting) when payload is larger than u16
 + remove HACKy sleeps from testing
++ simplify ClientState
 
 ### Sources
 + Nathan Sizemore: https://github.com/nathansizemore/websocket-stream
