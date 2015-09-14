@@ -608,9 +608,8 @@ impl WebSocketClient {
                         // FIXME: copy
                         let opcode : OpCode = self.read_buffer.frames.iter().next().unwrap().0.clone();
                         let mut output : Vec<u8> = Vec::new();
-                        for _ in 0..self.read_buffer.frames.len() {
-                            let frame = self.read_buffer.frames.pop_front().unwrap();
-                            output.extend(frame.1.iter());
+                        while let Some(frame) = self.read_buffer.frames.pop_front() {
+                            output.extend(frame.1);
                         }
 
                         assert!(self.read_buffer.scratch.is_empty());
