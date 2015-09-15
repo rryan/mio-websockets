@@ -738,10 +738,9 @@ impl WebSocketServer {
     pub fn new(ip: &str, port: u16) -> (WebSocketServer, InternalReader, InternalWriter) {
         let (output_tx, output_rx) = mpsc::channel();
 
-        let server_socket = tcp::TcpSocket::v4().unwrap();
+
         let address = FromStr::from_str(&format!("{}:{}", ip, port)).unwrap();
-        server_socket.bind(&address).unwrap();
-        let server_socket = server_socket.listen(256).unwrap();
+        let server_socket = tcp::TcpListener::bind(&address).unwrap();
 
         let mut counter = Counter::new();
         let server_token = counter.next();
