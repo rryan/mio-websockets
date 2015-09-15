@@ -3,7 +3,7 @@ name = "mio-websockets"
 version = "0.1.0"
 dependencies = [
  "http-muncher 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "mio 0.5.0-pre (git+https://github.com/carllerche/mio)",
+ "mio 0.5.0-pre (git+https://github.com/carllerche/mio?rev=3537a6980ae718d40f53e422f7a88ec7bc50299e)",
  "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
  "sha1 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "websocket 0.12.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "mio"
 version = "0.5.0-pre"
-source = "git+https://github.com/carllerche/mio#3537a6980ae718d40f53e422f7a88ec7bc50299e"
+source = "git+https://github.com/carllerche/mio?rev=3537a6980ae718d40f53e422f7a88ec7bc50299e#3537a6980ae718d40f53e422f7a88ec7bc50299e"
 dependencies = [
  "bytes 0.2.10 (git+https://github.com/carllerche/bytes?rev=7edb577d0a)",
  "clock_ticks 0.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
